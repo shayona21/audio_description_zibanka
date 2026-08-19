@@ -9,7 +9,7 @@ import os
 import time
 from dotenv import load_dotenv
 from excel_parser import parse_csv
-from tts_client import text_to_speech
+from tts_client import text_to_speech, pcm_to_wav
 from audio_builder import build_master_timeline, export_wav
 
 load_dotenv()
@@ -34,11 +34,13 @@ def run(excel_path, output_path="output_AD.wav"):
     for _, row in enumerate(rows):
         print(f"  Row {row['row_number']}/{len(rows)}: {row['text'][:40]}...")
 
-        # Call Google TTS
-        audio_bytes = text_to_speech(row["text"])
-        audio_clips.append(audio_bytes)
+        # Get raw PCM bytes from Gemini TTS
+        pcm_bytes = text_to_speech(row["text"])
 
-        # Small pause to avoid hitting API rate limits
+        # Convert PCM → WAV so pydub can read it
+        wav_bytes = pcm_to_wav(pcm_bytes)
+        audio_clips.append(wav_bytes)
+
         time.sleep(0.1)
 
     # Step 4: Build master timeline

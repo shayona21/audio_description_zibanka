@@ -8,7 +8,7 @@ import io
 # Total episode duration in milliseconds
 # 31 minutes = 31 * 60 * 1000 = 1,860,000 ms
 # We read this from the last row's end_time dynamically
-SAMPLE_RATE = 48000
+SAMPLE_RATE = 24000
 
 def build_master_timeline(ad_rows, audio_clips, episode_duration_ms):
     """
