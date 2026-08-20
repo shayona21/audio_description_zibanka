@@ -3,6 +3,7 @@
 # Upload a CSV file → generates a synchronized .wav file
 
 import os
+import re
 import uuid
 import threading
 from pathlib import Path
@@ -10,7 +11,7 @@ from flask import Flask, render_template, request, jsonify, send_file
 from dotenv import load_dotenv
 
 from excel_parser import parse_csv
-from tts_client import text_to_speech, pcm_to_wav
+from tts_client import AVAILABLE_VOICES, DEFAULT_VOICE, text_to_speech, pcm_to_wav
 from audio_builder import build_master_timeline, export_wav
 
 load_dotenv()
@@ -33,7 +34,11 @@ jobs = {}
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        voices=AVAILABLE_VOICES,
+        default_voice=DEFAULT_VOICE
+    )
 
 
 @app.route("/upload", methods=["POST"])
@@ -47,9 +52,26 @@ def upload():
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
+    requested_name = request.form.get("output_name", "").strip()
+    selected_voice = request.form.get("voice", DEFAULT_VOICE).strip()
 
     if not file.filename.lower().endswith(".csv"):
         return jsonify({"error": "Please upload a .csv file"}), 400
+
+    # Keep the user's name readable while removing characters that are unsafe
+    # or invalid in filenames across common operating systems.
+    if requested_name.lower().endswith(".wav"):
+        requested_name = requested_name[:-4].strip()
+    output_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", requested_name).strip(" .")
+    output_stem = output_stem[:120].rstrip(" .")
+
+    if not output_stem:
+        return jsonify({"error": "Please enter an output file name"}), 400
+
+    if selected_voice not in AVAILABLE_VOICES:
+        return jsonify({"error": "Please select a valid Gemini voice"}), 400
+
+    download_name = f"{output_stem}.wav"
 
     # Save the uploaded file with a unique name
     job_id   = uuid.uuid4().hex[:8]
@@ -63,18 +85,20 @@ def upload():
         "total":    0,
         "current":  0,
         "output":   None,
+        "download_name": download_name,
+        "voice": selected_voice,
         "error":    None
     }
 
     # Start processing in a background thread so the browser doesn't time out
     thread = threading.Thread(
         target=process_job,
-        args=(job_id, str(csv_path)),
+        args=(job_id, str(csv_path), selected_voice),
         daemon=True
     )
     thread.start()
 
-    return jsonify({"job_id": job_id})
+    return jsonify({"job_id": job_id, "download_name": download_name})
 
 
 @app.route("/status/<job_id>")
@@ -107,27 +131,31 @@ def download(job_id):
     return send_file(
         output_path,
         as_attachment=True,
-        download_name="audio_description.wav"
+        download_name=jobs[job_id]["download_name"]
     )
 
 
 # ── Background processing ─────────────────────────────────────────────────────
 
-def process_job(job_id, csv_path):
+def process_job(job_id, csv_path, voice=DEFAULT_VOICE):
     """
     Full pipeline: parse CSV → TTS → build timeline → export .wav
     Runs in a background thread. Updates jobs[job_id] as it goes.
     """
 
+    def report(message):
+        """Send a processing message to both the browser job log and terminal."""
+        log(job_id, message)
+
     try:
         # Step 1: Parse the CSV
         log(job_id, "Parsing CSV file...")
-        rows = parse_csv(csv_path)
+        rows = parse_csv(csv_path, progress_callback=report)
         jobs[job_id]["total"] = len(rows)
         log(job_id, f"Found {len(rows)} AD rows.")
 
         # Step 2: Convert each row to speech
-        log(job_id, "Converting rows to speech via Google TTS...")
+        log(job_id, f"Converting rows to speech via Gemini TTS (voice: {voice})...")
         audio_clips = []
 
         for i, row in enumerate(rows):
@@ -135,7 +163,7 @@ def process_job(job_id, csv_path):
             log(job_id, f"Row {i + 1}/{len(rows)}: {row['text'][:50]}...")
 
             # Get raw PCM bytes from Gemini TTS
-            pcm_bytes = text_to_speech(row["text"])
+            pcm_bytes = text_to_speech(row["text"], voice=voice)
 
             # Convert PCM → WAV so pydub can read it
             wav_bytes = pcm_to_wav(pcm_bytes)
@@ -144,12 +172,17 @@ def process_job(job_id, csv_path):
         # Step 3: Build the master timeline
         log(job_id, "Building master audio timeline...")
         episode_duration_ms = rows[-1]["start_ms"] + 120000
-        master = build_master_timeline(rows, audio_clips, episode_duration_ms)
+        master = build_master_timeline(
+            rows,
+            audio_clips,
+            episode_duration_ms,
+            progress_callback=report
+        )
 
         # Step 4: Export
         output_path = str(OUTPUT_DIR / f"{job_id}_output.wav")
         log(job_id, "Exporting .wav file...")
-        export_wav(master, output_path)
+        export_wav(master, output_path, progress_callback=report)
 
         # Mark job as done
         jobs[job_id]["status"] = "done"

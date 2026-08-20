@@ -29,7 +29,7 @@ def timecode_to_ms(timecode):
     return total_ms
 
 
-def parse_csv(file_path):
+def parse_csv(file_path, progress_callback=print):
     """
     Read the AD CSV file and return a list of rows.
 
@@ -79,7 +79,7 @@ def parse_csv(file_path):
                 "text":        text
             })
 
-    print(f"Parsed {len(rows)} AD rows from {file_path}")
+    progress_callback(f"Parsed {len(rows)} AD rows from {file_path}")
     return rows
 
 

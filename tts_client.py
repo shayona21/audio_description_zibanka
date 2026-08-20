@@ -42,6 +42,9 @@ def text_to_speech(text, voice=DEFAULT_VOICE):
         audio_bytes : raw PCM audio bytes (24000Hz, 16-bit, mono)
     """
 
+    if voice not in AVAILABLE_VOICES:
+        raise ValueError(f"Unsupported Gemini voice: {voice}")
+
     # Create the Gemini client using GEMINI_API_KEY from .env
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 

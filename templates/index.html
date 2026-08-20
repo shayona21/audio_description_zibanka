@@ -167,6 +167,12 @@
             transform: translateY(-2px);
         }
 
+        .upload-area.disabled {
+            opacity: 0.62;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
         .upload-icon {
             width: 48px;
             height: 48px;
@@ -242,6 +248,103 @@
             margin-top: 1px;
             color: var(--muted);
             font-size: 11px;
+        }
+
+        .output-field {
+            margin-top: 20px;
+        }
+
+        .field-label {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--ink);
+            font-size: 13px;
+            font-weight: 650;
+        }
+
+        .name-input-wrap {
+            position: relative;
+        }
+
+        .select-wrap {
+            position: relative;
+        }
+
+        #output-name {
+            width: 100%;
+            height: 48px;
+            padding: 0 64px 0 14px;
+            border: 1px solid var(--line-strong);
+            border-radius: 9px;
+            background: #fff;
+            color: var(--ink);
+            font-size: 14px;
+            outline: none;
+            transition: border-color 150ms ease, box-shadow 150ms ease;
+        }
+
+        #output-name::placeholder {
+            color: #9aa1a8;
+        }
+
+        #output-name:focus {
+            border-color: var(--brand);
+            box-shadow: 0 0 0 3px rgba(4, 79, 137, 0.1);
+        }
+
+        #output-name:disabled {
+            background: #f1f2f3;
+            color: var(--muted);
+        }
+
+        #voice-select {
+            width: 100%;
+            height: 48px;
+            padding: 0 42px 0 14px;
+            border: 1px solid var(--line-strong);
+            border-radius: 9px;
+            appearance: none;
+            background: #fff;
+            color: var(--ink);
+            cursor: pointer;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 150ms ease, box-shadow 150ms ease;
+        }
+
+        #voice-select:focus {
+            border-color: var(--brand);
+            box-shadow: 0 0 0 3px rgba(4, 79, 137, 0.1);
+        }
+
+        #voice-select:disabled {
+            background: #f1f2f3;
+            color: var(--muted);
+            cursor: not-allowed;
+        }
+
+        .select-wrap::after {
+            position: absolute;
+            top: calc(50% - 3px);
+            right: 17px;
+            width: 7px;
+            height: 7px;
+            border-right: 1.5px solid var(--muted);
+            border-bottom: 1.5px solid var(--muted);
+            content: "";
+            pointer-events: none;
+            transform: rotate(45deg) translateY(-50%);
+        }
+
+        .file-extension {
+            position: absolute;
+            top: 50%;
+            right: 14px;
+            color: var(--muted);
+            font-size: 13px;
+            font-weight: 650;
+            transform: translateY(-50%);
+            pointer-events: none;
         }
 
         .primary-button,
@@ -358,6 +461,11 @@
 
         #log p.error {
             color: var(--error);
+            font-weight: 700;
+        }
+
+        #log p.warning {
+            color: #9a5700;
             font-weight: 700;
         }
 
@@ -514,6 +622,33 @@
                     </div>
                 </div>
 
+                <div class="output-field">
+                    <label class="field-label" for="output-name">Output file name</label>
+                    <div class="name-input-wrap">
+                        <input
+                            type="text"
+                            id="output-name"
+                            name="output_name"
+                            maxlength="120"
+                            placeholder="e.g. Raktanchal S03 E07 AD"
+                            autocomplete="off"
+                            spellcheck="false"
+                        >
+                        <span class="file-extension" aria-hidden="true">.wav</span>
+                    </div>
+                </div>
+
+                <div class="output-field">
+                    <label class="field-label" for="voice-select">Narration voice</label>
+                    <div class="select-wrap">
+                        <select id="voice-select" name="voice">
+                            {% for voice in voices %}
+                                <option value="{{ voice }}"{% if voice == default_voice %} selected{% endif %}>{{ voice }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+
                 <button class="primary-button" id="submit-btn" type="button" disabled>
                     <span id="submit-label">Generate audio</span>
                 </button>
@@ -541,7 +676,7 @@
                             </span>
                             <div>
                                 <h2>Your audio is ready</h2>
-                                <p>audio_description.wav</p>
+                                <p id="output-file-name">audio_description.wav</p>
                             </div>
                         </div>
                         <a class="download-button" id="download-link" href="#">
@@ -569,6 +704,9 @@
         const fileSelection = document.getElementById("file-selection");
         const fileNameEl = document.getElementById("file-name");
         const fileSizeEl = document.getElementById("file-size");
+        const outputNameInput = document.getElementById("output-name");
+        const voiceSelect = document.getElementById("voice-select");
+        const outputFileName = document.getElementById("output-file-name");
         const submitBtn = document.getElementById("submit-btn");
         const submitLabel = document.getElementById("submit-label");
         const progressSection = document.getElementById("progress-section");
@@ -600,13 +738,14 @@
             if (file) selectFile(file);
         });
 
+        outputNameInput.addEventListener("input", updateSubmitState);
         submitBtn.addEventListener("click", submitFile);
 
         function selectFile(file) {
             if (!file.name.toLowerCase().endsWith(".csv")) {
                 selectedFile = null;
                 fileSelection.classList.remove("visible");
-                submitBtn.disabled = true;
+                updateSubmitState();
                 showProgressError("Please choose a CSV file.");
                 return;
             }
@@ -615,12 +754,13 @@
             fileNameEl.textContent = file.name;
             fileSizeEl.textContent = formatFileSize(file.size);
             fileSelection.classList.add("visible");
-            submitBtn.disabled = false;
+            updateSubmitState();
             submitLabel.textContent = "Generate audio";
         }
 
         function submitFile() {
-            if (!selectedFile) return;
+            const requestedOutputName = outputNameInput.value.trim();
+            if (!selectedFile || !requestedOutputName) return;
 
             if (pollInterval) clearInterval(pollInterval);
             lastLogCount = 0;
@@ -630,14 +770,18 @@
             setProgress(0);
             submitBtn.disabled = true;
             submitLabel.textContent = "Generating…";
+            setInputsDisabled(true);
 
             const formData = new FormData();
             formData.append("file", selectedFile);
+            formData.append("output_name", requestedOutputName);
+            formData.append("voice", voiceSelect.value);
 
             fetch("/upload", { method: "POST", body: formData })
                 .then(response => response.json().then(data => ({ ok: response.ok, data })))
                 .then(({ ok, data }) => {
                     if (!ok || data.error) throw new Error(data.error || "Upload failed");
+                    outputFileName.textContent = data.download_name;
                     pollStatus(data.job_id);
                     pollInterval = setInterval(() => pollStatus(data.job_id), 2000);
                 })
@@ -656,7 +800,9 @@
                     progressLines.slice(lastLogCount).forEach(line => {
                         const isDone = line.startsWith("Complete");
                         const isError = line.startsWith("Error");
-                        appendLog(line, isDone ? "done" : isError ? "error" : "");
+                        const isWarning = line.includes("OVERLAP DETECTED");
+                        const logClass = isDone ? "done" : isError ? "error" : isWarning ? "warning" : "";
+                        appendLog(line, logClass);
                     });
                     lastLogCount = progressLines.length;
 
@@ -669,11 +815,14 @@
                         setProgress(100);
                         downloadSection.style.display = "block";
                         document.getElementById("download-link").href = "/download/" + jobId;
-                        submitBtn.disabled = false;
+                        outputFileName.textContent = data.download_name;
+                        setInputsDisabled(false);
+                        updateSubmitState();
                         submitLabel.textContent = "Generate another track";
                     } else if (data.status === "error") {
                         clearInterval(pollInterval);
-                        submitBtn.disabled = false;
+                        setInputsDisabled(false);
+                        updateSubmitState();
                         submitLabel.textContent = "Try again";
                     }
                 })
@@ -707,8 +856,20 @@
         function finishWithError(message) {
             if (pollInterval) clearInterval(pollInterval);
             appendLog("Error: " + message, "error");
-            submitBtn.disabled = false;
+            setInputsDisabled(false);
+            updateSubmitState();
             submitLabel.textContent = "Try again";
+        }
+
+        function updateSubmitState() {
+            submitBtn.disabled = !selectedFile || !outputNameInput.value.trim();
+        }
+
+        function setInputsDisabled(disabled) {
+            fileInput.disabled = disabled;
+            outputNameInput.disabled = disabled;
+            voiceSelect.disabled = disabled;
+            uploadArea.classList.toggle("disabled", disabled);
         }
 
         function formatFileSize(bytes) {

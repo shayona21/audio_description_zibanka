@@ -31,7 +31,7 @@ def run(excel_path, output_path="output_AD.wav"):
     print(f"\nStep 2: Converting {len(rows)} rows to speech...")
     audio_clips = []
 
-    for _, row in enumerate(rows):
+    for _, row in enumerate(rows[:5]):
         print(f"  Row {row['row_number']}/{len(rows)}: {row['text'][:40]}...")
 
         # Get raw PCM bytes from Gemini TTS
