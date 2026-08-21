@@ -1,6 +1,6 @@
 # app.py
 # Flask web UI for the Audio Description tool
-# Upload a CSV file → generates a synchronized .wav file
+# Upload a CSV or Excel file → generates a synchronized .wav file
 
 import os
 import re
@@ -10,7 +10,7 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_file
 from dotenv import load_dotenv
 
-from excel_parser import parse_csv
+from excel_parser import SUPPORTED_EXTENSIONS, detect_file_type, parse_file
 from tts_client import AVAILABLE_VOICES, DEFAULT_VOICE, text_to_speech, pcm_to_wav
 from audio_builder import build_master_timeline, export_wav
 
@@ -44,7 +44,7 @@ def index():
 @app.route("/upload", methods=["POST"])
 def upload():
     """
-    Receive the uploaded CSV file, start processing in a background thread,
+    Receive an uploaded CSV or Excel file, process it in a background thread,
     and return a job_id the browser can use to poll progress.
     """
 
@@ -55,8 +55,11 @@ def upload():
     requested_name = request.form.get("output_name", "").strip()
     selected_voice = request.form.get("voice", DEFAULT_VOICE).strip()
 
-    if not file.filename.lower().endswith(".csv"):
-        return jsonify({"error": "Please upload a .csv file"}), 400
+    upload_extension = Path(file.filename or "").suffix.lower()
+    if upload_extension not in SUPPORTED_EXTENSIONS:
+        return jsonify({
+            "error": "Please upload a CSV or Excel file (.csv, .xlsx, .xls, or .xlsm)"
+        }), 400
 
     # Keep the user's name readable while removing characters that are unsafe
     # or invalid in filenames across common operating systems.
@@ -75,8 +78,8 @@ def upload():
 
     # Save the uploaded file with a unique name
     job_id   = uuid.uuid4().hex[:8]
-    csv_path = UPLOAD_DIR / f"{job_id}.csv"
-    file.save(csv_path)
+    upload_path = UPLOAD_DIR / f"{job_id}{upload_extension}"
+    file.save(upload_path)
 
     # Initialize job state
     jobs[job_id] = {
@@ -93,7 +96,7 @@ def upload():
     # Start processing in a background thread so the browser doesn't time out
     thread = threading.Thread(
         target=process_job,
-        args=(job_id, str(csv_path), selected_voice),
+        args=(job_id, str(upload_path), selected_voice),
         daemon=True
     )
     thread.start()
@@ -137,9 +140,9 @@ def download(job_id):
 
 # ── Background processing ─────────────────────────────────────────────────────
 
-def process_job(job_id, csv_path, voice=DEFAULT_VOICE):
+def process_job(job_id, upload_path, voice=DEFAULT_VOICE):
     """
-    Full pipeline: parse CSV → TTS → build timeline → export .wav
+    Full pipeline: parse CSV/Excel → TTS → build timeline → export .wav
     Runs in a background thread. Updates jobs[job_id] as it goes.
     """
 
@@ -148,9 +151,10 @@ def process_job(job_id, csv_path, voice=DEFAULT_VOICE):
         log(job_id, message)
 
     try:
-        # Step 1: Parse the CSV
-        log(job_id, "Parsing CSV file...")
-        rows = parse_csv(csv_path, progress_callback=report)
+        # Step 1: Detect and parse the uploaded tabular file.
+        file_type = detect_file_type(upload_path)
+        log(job_id, f"Parsing {file_type.upper()} file...")
+        rows = parse_file(upload_path, progress_callback=report)
         jobs[job_id]["total"] = len(rows)
         log(job_id, f"Found {len(rows)} AD rows.")
 

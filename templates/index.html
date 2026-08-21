@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Generate synchronized audio-description tracks from a CSV script.">
+    <meta name="description" content="Generate synchronized audio-description tracks from a CSV or Excel script.">
     <title>Audio Description | Zibanka</title>
     <style>
         :root {
@@ -323,6 +323,34 @@
             cursor: not-allowed;
         }
 
+        .voice-preview-note {
+            margin-top: 12px;
+            padding: 12px 14px;
+            border: 1px solid #d7e2eb;
+            border-radius: 9px;
+            background: #f5f9fc;
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.55;
+        }
+
+        .voice-preview-note a {
+            color: var(--brand);
+            font-weight: 650;
+            text-decoration-thickness: 1px;
+            text-underline-offset: 2px;
+        }
+
+        .voice-preview-note a:hover {
+            color: var(--brand-dark);
+        }
+
+        .voice-preview-note a:focus-visible {
+            border-radius: 2px;
+            outline: 3px solid rgba(255, 144, 0, 0.32);
+            outline-offset: 2px;
+        }
+
         .select-wrap::after {
             position: absolute;
             top: calc(50% - 3px);
@@ -596,13 +624,13 @@
                 <p class="eyebrow">Audio workflow</p>
                 <h1 id="page-title">Create an audio description track.</h1>
                 <p class="subtitle">
-                    Upload a prepared CSV script to generate a synchronized WAV file,
+                    Add Excel or CSV files to generate a synchronized WAV file,
                     ready for your production timeline.
                 </p>
             </section>
 
             <section class="tool-card" aria-label="Audio description generator">
-                <input type="file" id="file-input" accept=".csv,text/csv">
+                <input type="file" id="file-input" accept=".csv,.xlsx,.xls,.xlsm,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
                 <label class="upload-area" id="upload-area" for="file-input">
                     <span class="upload-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -610,12 +638,12 @@
                             <path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"></path>
                         </svg>
                     </span>
-                    <span class="upload-title"><span>Choose a CSV</span> or drag it here</span>
+                    <span class="upload-title"><span>Choose an Excel or CSV file</span> or drag it here</span>
                     <span class="upload-hint">Start timecode · End timecode · Hindi dialogue</span>
                 </label>
 
                 <div class="file-selection" id="file-selection" aria-live="polite">
-                    <span class="file-type">CSV</span>
+                    <span class="file-type" id="file-type">FILE</span>
                     <div class="file-details">
                         <div id="file-name"></div>
                         <div id="file-size"></div>
@@ -647,6 +675,10 @@
                             {% endfor %}
                         </select>
                     </div>
+                    <p class="voice-preview-note">
+                        Want to preview how the voices sound?
+                        <a href="https://cloud.google.com/text-to-speech" target="_blank" rel="noopener noreferrer">Listen on Google Cloud Text-to-Speech</a>.
+                    </p>
                 </div>
 
                 <button class="primary-button" id="submit-btn" type="button" disabled>
@@ -704,6 +736,7 @@
         const fileSelection = document.getElementById("file-selection");
         const fileNameEl = document.getElementById("file-name");
         const fileSizeEl = document.getElementById("file-size");
+        const fileTypeEl = document.getElementById("file-type");
         const outputNameInput = document.getElementById("output-name");
         const voiceSelect = document.getElementById("voice-select");
         const outputFileName = document.getElementById("output-file-name");
@@ -742,15 +775,19 @@
         submitBtn.addEventListener("click", submitFile);
 
         function selectFile(file) {
-            if (!file.name.toLowerCase().endsWith(".csv")) {
+            const extension = file.name.split(".").pop().toLowerCase();
+            const supportedExtensions = ["csv", "xlsx", "xls", "xlsm"];
+
+            if (!supportedExtensions.includes(extension)) {
                 selectedFile = null;
                 fileSelection.classList.remove("visible");
                 updateSubmitState();
-                showProgressError("Please choose a CSV file.");
+                showProgressError("Please choose a CSV or Excel file (.csv, .xlsx, .xls, or .xlsm).");
                 return;
             }
 
             selectedFile = file;
+            fileTypeEl.textContent = extension.toUpperCase();
             fileNameEl.textContent = file.name;
             fileSizeEl.textContent = formatFileSize(file.size);
             fileSelection.classList.add("visible");

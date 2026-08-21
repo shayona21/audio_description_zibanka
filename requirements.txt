@@ -1,0 +1,6 @@
+Flask
+google-genai
+openpyxl
+pydub
+python-dotenv
+xlrd

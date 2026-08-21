@@ -8,7 +8,7 @@
 import os
 import time
 from dotenv import load_dotenv
-from excel_parser import parse_csv
+from excel_parser import parse_file
 from tts_client import text_to_speech, pcm_to_wav
 from audio_builder import build_master_timeline, export_wav
 
@@ -21,7 +21,7 @@ def run(excel_path, output_path="output_AD.wav"):
 
     # Step 1: Parse the Excel file
     print("Step 1: Parsing CSV or Excel AD...")
-    rows = parse_csv(excel_path)
+    rows = parse_file(excel_path)
 
     # Step 2: Get episode duration from last row's end time
     episode_duration_ms = rows[-1]["end_ms"] + 5000  # add 5 sec buffer at end
