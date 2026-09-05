@@ -1,4 +1,5 @@
 Flask
+# System dependency: FFmpeg must be on PATH for speed dial values above 1.00x.
 google-genai
 openpyxl
 pydub

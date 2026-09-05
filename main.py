@@ -11,13 +11,16 @@ from dotenv import load_dotenv
 from excel_parser import parse_file
 from tts_client import text_to_speech, pcm_to_wav
 from audio_builder import build_master_timeline, export_wav
+from audio_speed import adjust_audio_speed, check_speed_support
 
 load_dotenv()
 
-def run(excel_path, output_path="output_AD.wav"):
+def run(excel_path, output_path="output_AD.wav", speed=1.0):
     """
     Full pipeline: Excel/CSV → .wav
     """
+
+    speed = check_speed_support(speed)
 
     # Step 1: Parse the Excel file
     print("Step 1: Parsing CSV or Excel AD...")
@@ -39,6 +42,7 @@ def run(excel_path, output_path="output_AD.wav"):
 
         # Convert PCM → WAV so pydub can read it
         wav_bytes = pcm_to_wav(pcm_bytes)
+        wav_bytes = adjust_audio_speed(wav_bytes, speed)
         audio_clips.append(wav_bytes)
 
         time.sleep(0.1)

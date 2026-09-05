@@ -323,6 +323,16 @@
             cursor: not-allowed;
         }
 
+        #speed-dial {
+            width: 100%;
+            accent-color: var(--brand);
+            cursor: pointer;
+        }
+
+        #speed-dial:disabled {
+            cursor: not-allowed;
+        }
+
         .voice-preview-note {
             margin-top: 12px;
             padding: 12px 14px;
@@ -681,6 +691,12 @@
                     </p>
                 </div>
 
+                <div class="output-field">
+                    <label class="field-label" for="speed-dial">Speed dial · <output id="speed-value" for="speed-dial">1.00x</output></label>
+                    <input type="range" id="speed-dial" name="speed" min="1.00" max="{{ '%.2f' | format(max_speed_rate) }}" step="0.01" value="1.00" aria-describedby="speed-help">
+                    <p class="voice-preview-note" id="speed-help">1.00x–{{ '%.2f' | format(max_speed_rate) }}x. Higher speeds shorten each spoken line while preserving voice pitch. Scheduled start times and total track duration stay the same.</p>
+                </div>
+
                 <button class="primary-button" id="submit-btn" type="button" disabled>
                     <span id="submit-label">Generate audio</span>
                 </button>
@@ -739,6 +755,11 @@
         const fileTypeEl = document.getElementById("file-type");
         const outputNameInput = document.getElementById("output-name");
         const voiceSelect = document.getElementById("voice-select");
+        const speedDial = document.getElementById("speed-dial");
+        const speedValue = document.getElementById("speed-value");
+        speedDial.addEventListener("input", () => {
+            speedValue.textContent = Number(speedDial.value).toFixed(2) + "x";
+        });
         const outputFileName = document.getElementById("output-file-name");
         const submitBtn = document.getElementById("submit-btn");
         const submitLabel = document.getElementById("submit-label");
@@ -813,6 +834,7 @@
             formData.append("file", selectedFile);
             formData.append("output_name", requestedOutputName);
             formData.append("voice", voiceSelect.value);
+            formData.append("speed", speedDial.value);
 
             fetch("/upload", { method: "POST", body: formData })
                 .then(response => response.json().then(data => ({ ok: response.ok, data })))
@@ -906,6 +928,7 @@
             fileInput.disabled = disabled;
             outputNameInput.disabled = disabled;
             voiceSelect.disabled = disabled;
+            speedDial.disabled = disabled;
             uploadArea.classList.toggle("disabled", disabled);
         }
 
