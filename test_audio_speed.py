@@ -98,7 +98,7 @@ class WebSpeedTests(unittest.TestCase):
         original = Sine(440, sample_rate=24000).to_audio_segment(duration=1200)
         events = []
 
-        def generate(text, voice):
+        def generate(text, voice, language):
             events.append("generate")
             return original.raw_data
 

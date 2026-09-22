@@ -9,17 +9,18 @@ import os
 import time
 from dotenv import load_dotenv
 from excel_parser import parse_file
-from tts_client import text_to_speech, pcm_to_wav
+from tts_client import DEFAULT_LANGUAGE, text_to_speech, pcm_to_wav, validate_language
 from audio_builder import build_master_timeline, export_wav
 from audio_speed import adjust_audio_speed, check_speed_support
 
 load_dotenv()
 
-def run(excel_path, output_path="output_AD.wav", speed=1.0):
+def run(excel_path, output_path="output_AD.wav", speed=1.0, language=DEFAULT_LANGUAGE):
     """
     Full pipeline: Excel/CSV → .wav
     """
 
+    language = validate_language(language)
     speed = check_speed_support(speed)
 
     # Step 1: Parse the Excel file
@@ -38,7 +39,7 @@ def run(excel_path, output_path="output_AD.wav", speed=1.0):
         print(f"  Row {row['row_number']}/{len(rows)}: {row['text'][:40]}...")
 
         # Get raw PCM bytes from Gemini TTS
-        pcm_bytes = text_to_speech(row["text"])
+        pcm_bytes = text_to_speech(row["text"], language=language)
 
         # Convert PCM → WAV so pydub can read it
         wav_bytes = pcm_to_wav(pcm_bytes)

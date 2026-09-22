@@ -1,5 +1,5 @@
 # tts_client.py
-# Sends Hindi text to Gemini TTS API and returns raw audio bytes
+# Sends narration text to Gemini TTS API and returns raw audio bytes
 # Uses the high-quality gemini-3.1-flash-tts-preview model
 # with the 30 available Gemini voices
 
@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Available Gemini voices ───────────────────────────────────────────────────
-# Pick any of these — they all support Hindi automatically
+# Voice characteristics are independent of the narration language.
 AVAILABLE_VOICES = [
     "Aoede", "Achird", "Algenib", "Algieba", "Alnilam",
     "Autonoe", "Callirrhoe", "Charon", "Despina", "Enceladus",
@@ -25,18 +25,46 @@ AVAILABLE_VOICES = [
 # Default voice — calm, clear, good for narration
 DEFAULT_VOICE = "Kore"
 
+# Supported Gemini TTS languages (shared by the UI and request validation).
+# https://ai.google.dev/gemini-api/docs/speech-generation#supported-languages
+AVAILABLE_LANGUAGES = sorted([
+    "Afrikaans", "Albanian", "Amharic", "Arabic", "Armenian", "Azerbaijani",
+    "Bangla", "Basque", "Belarusian", "Bulgarian", "Burmese", "Catalan",
+    "Cebuano", "Chinese (Mandarin)", "Croatian", "Czech", "Danish", "Dutch",
+    "English", "Estonian", "Filipino", "Finnish", "French", "Galician",
+    "Georgian", "German", "Greek", "Gujarati", "Haitian Creole", "Hebrew",
+    "Hindi", "Hungarian", "Icelandic", "Indonesian", "Italian", "Japanese",
+    "Javanese", "Kannada", "Konkani", "Korean", "Lao", "Latin", "Latvian",
+    "Lithuanian", "Luxembourgish", "Macedonian", "Maithili", "Malagasy",
+    "Malay", "Malayalam", "Marathi", "Mongolian", "Nepali",
+    "Norwegian (Bokmål)", "Norwegian (Nynorsk)", "Odia", "Pashto", "Persian",
+    "Polish", "Portuguese", "Punjabi", "Romanian", "Russian", "Serbian",
+    "Sindhi", "Sinhala", "Slovak", "Slovenian", "Spanish", "Swahili",
+    "Swedish", "Tamil", "Telugu", "Thai", "Turkish", "Ukrainian", "Urdu",
+    "Vietnamese",
+])
+DEFAULT_LANGUAGE = "Hindi"
+
 # Narration style instruction — added before each sentence
 # Gemini TTS understands plain English instructions
-NARRATION_STYLE = "Speak in a calm, clear, neutral Hindi narration tone for audio description:"
+NARRATION_STYLE = "Speak in a calm, clear, neutral {language} narration tone for audio description:"
 
 
-def text_to_speech(text, voice=DEFAULT_VOICE):
+def validate_language(language):
+    """Reject unsupported languages before starting work or calling Gemini."""
+    if language not in AVAILABLE_LANGUAGES:
+        raise ValueError("Please select a supported narration language")
+    return language
+
+
+def text_to_speech(text, voice=DEFAULT_VOICE, language=DEFAULT_LANGUAGE):
     """
-    Convert Hindi text to speech using Gemini TTS API.
+    Convert narration text to speech using Gemini TTS API.
 
     Parameters:
-        text  : Hindi string to convert
+        text  : Script text in the selected language (not translated here)
         voice : Gemini voice name (default: Kore)
+        language : Narration language (default: Hindi)
 
     Returns:
         audio_bytes : raw PCM audio bytes (24000Hz, 16-bit, mono)
@@ -44,12 +72,13 @@ def text_to_speech(text, voice=DEFAULT_VOICE):
 
     if voice not in AVAILABLE_VOICES:
         raise ValueError(f"Unsupported Gemini voice: {voice}")
+    language = validate_language(language)
 
     # Create the Gemini client using GEMINI_API_KEY from .env
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-    # Add narration style instruction before the Hindi text
-    prompt = f"{NARRATION_STYLE} {text}"
+    # Keep language local to this request so simultaneous jobs stay independent.
+    prompt = f"{NARRATION_STYLE.format(language=language)} {text}"
 
     # Call the Gemini TTS API
     response = client.models.generate_content(

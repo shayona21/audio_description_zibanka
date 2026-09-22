@@ -11,7 +11,10 @@ from flask import Flask, render_template, request, jsonify, send_file
 from dotenv import load_dotenv
 
 from excel_parser import SUPPORTED_EXTENSIONS, detect_file_type, parse_file
-from tts_client import AVAILABLE_VOICES, DEFAULT_VOICE, text_to_speech, pcm_to_wav
+from tts_client import (
+    AVAILABLE_LANGUAGES, AVAILABLE_VOICES, DEFAULT_LANGUAGE, DEFAULT_VOICE,
+    text_to_speech, pcm_to_wav, validate_language,
+)
 from audio_builder import build_master_timeline, export_wav
 from audio_speed import adjust_audio_speed, check_speed_support
 import audio_speed
@@ -40,6 +43,8 @@ def index():
         "index.html",
         voices=AVAILABLE_VOICES,
         default_voice=DEFAULT_VOICE,
+        languages=AVAILABLE_LANGUAGES,
+        default_language=DEFAULT_LANGUAGE,
         max_speed_rate=audio_speed.MAX_SPEED_RATE,
     )
 
@@ -58,6 +63,9 @@ def upload():
     requested_name = request.form.get("output_name", "").strip()
     selected_voice = request.form.get("voice", DEFAULT_VOICE).strip()
     try:
+        selected_language = validate_language(
+            request.form.get("language", DEFAULT_LANGUAGE).strip()
+        )
         speed = check_speed_support(request.form.get("speed", "1.00"))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -99,6 +107,7 @@ def upload():
         "output":   None,
         "download_name": download_name,
         "voice": selected_voice,
+        "language": selected_language,
         "speed": speed,
         "error":    None
     }
@@ -107,6 +116,7 @@ def upload():
     thread = threading.Thread(
         target=process_job,
         args=(job_id, str(upload_path), selected_voice, speed),
+        kwargs={"language": selected_language},
         daemon=True
     )
     thread.start()
@@ -150,7 +160,8 @@ def download(job_id):
 
 # ── Background processing ─────────────────────────────────────────────────────
 
-def process_job(job_id, upload_path, voice=DEFAULT_VOICE, speed=1.0):
+def process_job(job_id, upload_path, voice=DEFAULT_VOICE, speed=1.0,
+                language=DEFAULT_LANGUAGE):
     """
     Full pipeline: parse CSV/Excel → TTS → build timeline → export .wav
     Runs in a background thread. Updates jobs[job_id] as it goes.
@@ -161,6 +172,8 @@ def process_job(job_id, upload_path, voice=DEFAULT_VOICE, speed=1.0):
         log(job_id, message)
 
     try:
+        language = validate_language(language)
+        log(job_id, f"Narration language: {language}")
         speed = check_speed_support(speed)
         log(job_id, f"Speed dial: {speed:.2f}x (pitch preserved)")
         # Step 1: Detect and parse the uploaded tabular file.
@@ -179,7 +192,7 @@ def process_job(job_id, upload_path, voice=DEFAULT_VOICE, speed=1.0):
             log(job_id, f"Row {i + 1}/{len(rows)}: {row['text'][:50]}...")
 
             # Get raw PCM bytes from Gemini TTS
-            pcm_bytes = text_to_speech(row["text"], voice=voice)
+            pcm_bytes = text_to_speech(row["text"], voice=voice, language=language)
 
             # Convert PCM → WAV so pydub can read it
             wav_bytes = pcm_to_wav(pcm_bytes)

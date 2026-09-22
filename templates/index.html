@@ -297,7 +297,7 @@
             color: var(--muted);
         }
 
-        #voice-select {
+        .select-wrap select {
             width: 100%;
             height: 48px;
             padding: 0 42px 0 14px;
@@ -312,12 +312,12 @@
             transition: border-color 150ms ease, box-shadow 150ms ease;
         }
 
-        #voice-select:focus {
+        .select-wrap select:focus {
             border-color: var(--brand);
             box-shadow: 0 0 0 3px rgba(4, 79, 137, 0.1);
         }
 
-        #voice-select:disabled {
+        .select-wrap select:disabled {
             background: #f1f2f3;
             color: var(--muted);
             cursor: not-allowed;
@@ -649,7 +649,7 @@
                         </svg>
                     </span>
                     <span class="upload-title"><span>Choose an Excel or CSV file</span> or drag it here</span>
-                    <span class="upload-hint">Start timecode · End timecode · Hindi dialogue</span>
+                    <span class="upload-hint">Start timecode · End timecode · Narration text</span>
                 </label>
 
                 <div class="file-selection" id="file-selection" aria-live="polite">
@@ -674,6 +674,18 @@
                         >
                         <span class="file-extension" aria-hidden="true">.wav</span>
                     </div>
+                </div>
+
+                <div class="output-field">
+                    <label class="field-label" for="language-select">Narration language</label>
+                    <div class="select-wrap">
+                        <select id="language-select" name="language" aria-describedby="language-help">
+                            {% for language in languages %}
+                                <option value="{{ language }}"{% if language == default_language %} selected{% endif %}>{{ language }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <p class="voice-preview-note" id="language-help">Choose language to generate AD audio file above</p>
                 </div>
 
                 <div class="output-field">
@@ -755,6 +767,7 @@
         const fileTypeEl = document.getElementById("file-type");
         const outputNameInput = document.getElementById("output-name");
         const voiceSelect = document.getElementById("voice-select");
+        const languageSelect = document.getElementById("language-select");
         const speedDial = document.getElementById("speed-dial");
         const speedValue = document.getElementById("speed-value");
         speedDial.addEventListener("input", () => {
@@ -834,6 +847,7 @@
             formData.append("file", selectedFile);
             formData.append("output_name", requestedOutputName);
             formData.append("voice", voiceSelect.value);
+            formData.append("language", languageSelect.value);
             formData.append("speed", speedDial.value);
 
             fetch("/upload", { method: "POST", body: formData })
@@ -928,6 +942,7 @@
             fileInput.disabled = disabled;
             outputNameInput.disabled = disabled;
             voiceSelect.disabled = disabled;
+            languageSelect.disabled = disabled;
             speedDial.disabled = disabled;
             uploadArea.classList.toggle("disabled", disabled);
         }
