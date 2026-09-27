@@ -71,7 +71,11 @@ class WebSpeedTests(unittest.TestCase):
         self.client = web.app.test_client()
 
     def upload(self, speed=None):
-        data = {"file": (io.BytesIO(b"test"), "script.csv"), "output_name": "track"}
+        data = {
+            "file": (io.BytesIO(b"test"), "script.csv"),
+            "output_name": "track",
+            "voice": "test-voice-id",
+        }
         if speed is not None:
             data["speed"] = speed
         return self.client.post("/upload", data=data)

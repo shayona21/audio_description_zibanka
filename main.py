@@ -1,7 +1,7 @@
 # main.py
 # Ties everything together:
 # 1. Parse Excel
-# 2. Convert each row to speech via Google TTS
+# 2. Convert each row to speech via ElevenLabs TTS
 # 3. Place each clip on master timeline
 # 4. Export as .wav
 
@@ -38,7 +38,7 @@ def run(excel_path, output_path="output_AD.wav", speed=1.0, language=DEFAULT_LAN
     for _, row in enumerate(rows[:5]):
         print(f"  Row {row['row_number']}/{len(rows)}: {row['text'][:40]}...")
 
-        # Get raw PCM bytes from Gemini TTS
+        # Get raw PCM bytes from ElevenLabs TTS
         pcm_bytes = text_to_speech(row["text"], language=language)
 
         # Convert PCM → WAV so pydub can read it

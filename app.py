@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from excel_parser import SUPPORTED_EXTENSIONS, detect_file_type, parse_file
 from tts_client import (
-    AVAILABLE_LANGUAGES, AVAILABLE_VOICES, DEFAULT_LANGUAGE, DEFAULT_VOICE,
+    AVAILABLE_LANGUAGES, DEFAULT_LANGUAGE, DEFAULT_VOICE,
     text_to_speech, pcm_to_wav, validate_language,
 )
 from audio_builder import build_master_timeline, export_wav
@@ -41,7 +41,6 @@ jobs = {}
 def index():
     return render_template(
         "index.html",
-        voices=AVAILABLE_VOICES,
         default_voice=DEFAULT_VOICE,
         languages=AVAILABLE_LANGUAGES,
         default_language=DEFAULT_LANGUAGE,
@@ -88,8 +87,8 @@ def upload():
     if not output_stem:
         return jsonify({"error": "Please enter an output file name"}), 400
 
-    if selected_voice not in AVAILABLE_VOICES:
-        return jsonify({"error": "Please select a valid Gemini voice"}), 400
+    if not selected_voice:
+        return jsonify({"error": "Please enter an ElevenLabs voice ID"}), 400
 
     download_name = f"{output_stem}.wav"
 
@@ -184,14 +183,14 @@ def process_job(job_id, upload_path, voice=DEFAULT_VOICE, speed=1.0,
         log(job_id, f"Found {len(rows)} AD rows.")
 
         # Step 2: Convert each row to speech
-        log(job_id, f"Converting rows to speech via Gemini TTS (voice: {voice})...")
+        log(job_id, f"Converting rows to speech via ElevenLabs (voice: {voice})...")
         audio_clips = []
 
         for i, row in enumerate(rows):
             jobs[job_id]["current"] = i + 1
             log(job_id, f"Row {i + 1}/{len(rows)}: {row['text'][:50]}...")
 
-            # Get raw PCM bytes from Gemini TTS
+            # Get raw PCM bytes from ElevenLabs TTS
             pcm_bytes = text_to_speech(row["text"], voice=voice, language=language)
 
             # Convert PCM → WAV so pydub can read it

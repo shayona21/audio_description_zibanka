@@ -1,57 +1,36 @@
-# tts_client.py
-# Sends narration text to Gemini TTS API and returns raw audio bytes
-# Uses the high-quality gemini-3.1-flash-tts-preview model
-# with the 30 available Gemini voices
+# Sends narration text to ElevenLabs TTS and returns raw PCM audio bytes.
 
 import wave
 import os
-from google import genai
-from google.genai import types
+import json
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Available Gemini voices ───────────────────────────────────────────────────
-# Voice characteristics are independent of the narration language.
-AVAILABLE_VOICES = [
-    "Aoede", "Achird", "Algenib", "Algieba", "Alnilam",
-    "Autonoe", "Callirrhoe", "Charon", "Despina", "Enceladus",
-    "Erinome", "Fenrir", "Gacrux", "Iapetus", "Kore",
-    "Laomedeia", "Leda", "Orus", "Puck", "Pulcherrima",
-    "Rasalgethi", "Sadachbia", "Sadaltager", "Schedar", "Sulafat",
-    "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi", "Achernar"
-]
-
-# Default voice — calm, clear, good for narration
-DEFAULT_VOICE = "Kore"
-
-# Supported Gemini TTS languages (shared by the UI and request validation).
-# https://ai.google.dev/gemini-api/docs/speech-generation#supported-languages
-AVAILABLE_LANGUAGES = sorted([
-    "Afrikaans", "Albanian", "Amharic", "Arabic", "Armenian", "Azerbaijani",
-    "Bangla", "Basque", "Belarusian", "Bulgarian", "Burmese", "Catalan",
-    "Cebuano", "Chinese (Mandarin)", "Croatian", "Czech", "Danish", "Dutch",
-    "English", "Estonian", "Filipino", "Finnish", "French", "Galician",
-    "Georgian", "German", "Greek", "Gujarati", "Haitian Creole", "Hebrew",
-    "Hindi", "Hungarian", "Icelandic", "Indonesian", "Italian", "Japanese",
-    "Javanese", "Kannada", "Konkani", "Korean", "Lao", "Latin", "Latvian",
-    "Lithuanian", "Luxembourgish", "Macedonian", "Maithili", "Malagasy",
-    "Malay", "Malayalam", "Marathi", "Mongolian", "Nepali",
-    "Norwegian (Bokmål)", "Norwegian (Nynorsk)", "Odia", "Pashto", "Persian",
-    "Polish", "Portuguese", "Punjabi", "Romanian", "Russian", "Serbian",
-    "Sindhi", "Sinhala", "Slovak", "Slovenian", "Spanish", "Swahili",
-    "Swedish", "Tamil", "Telugu", "Thai", "Turkish", "Ukrainian", "Urdu",
-    "Vietnamese",
-])
+# ElevenLabs Flash v2.5 language support, keyed by the UI's display names.
+LANGUAGE_CODES = {
+    "Arabic": "ar", "Bulgarian": "bg", "Chinese (Mandarin)": "zh",
+    "Croatian": "hr", "Czech": "cs", "Danish": "da", "Dutch": "nl",
+    "English": "en", "Filipino": "fil", "Finnish": "fi", "French": "fr",
+    "German": "de", "Greek": "el", "Hindi": "hi", "Hungarian": "hu",
+    "Indonesian": "id", "Italian": "it", "Japanese": "ja", "Korean": "ko",
+    "Malay": "ms", "Norwegian": "no", "Polish": "pl", "Portuguese": "pt",
+    "Romanian": "ro", "Russian": "ru", "Slovak": "sk", "Spanish": "es",
+    "Swedish": "sv", "Tamil": "ta", "Turkish": "tr", "Ukrainian": "uk",
+    "Vietnamese": "vi",
+}
+AVAILABLE_LANGUAGES = sorted(LANGUAGE_CODES)
 DEFAULT_LANGUAGE = "Hindi"
-
-# Narration style instruction — added before each sentence
-# Gemini TTS understands plain English instructions
-NARRATION_STYLE = "Speak in a calm, clear, neutral {language} narration tone for audio description:"
+DEFAULT_VOICE = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+MODEL_ID = "eleven_flash_v2_5"
+SAMPLE_RATE = 24000
 
 
 def validate_language(language):
-    """Reject unsupported languages before starting work or calling Gemini."""
+    """Reject languages unsupported by ElevenLabs Multilingual v2."""
     if language not in AVAILABLE_LANGUAGES:
         raise ValueError("Please select a supported narration language")
     return language
@@ -59,57 +38,63 @@ def validate_language(language):
 
 def text_to_speech(text, voice=DEFAULT_VOICE, language=DEFAULT_LANGUAGE):
     """
-    Convert narration text to speech using Gemini TTS API.
+    Convert narration text to speech using the ElevenLabs text-to-speech API.
 
     Parameters:
         text  : Script text in the selected language (not translated here)
-        voice : Gemini voice name (default: Kore)
+        voice : ElevenLabs voice ID (default: ELEVENLABS_VOICE_ID from .env)
         language : Narration language (default: Hindi)
 
     Returns:
         audio_bytes : raw PCM audio bytes (24000Hz, 16-bit, mono)
     """
 
-    if voice not in AVAILABLE_VOICES:
-        raise ValueError(f"Unsupported Gemini voice: {voice}")
+    voice = (voice or DEFAULT_VOICE).strip()
+    if not voice:
+        raise ValueError("Set ELEVENLABS_VOICE_ID or enter an ElevenLabs voice ID")
     language = validate_language(language)
 
-    # Create the Gemini client using GEMINI_API_KEY from .env
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set ELEVENLABS_API_KEY in your .env file")
 
-    # Keep language local to this request so simultaneous jobs stay independent.
-    prompt = f"{NARRATION_STYLE.format(language=language)} {text}"
-
-    # Call the Gemini TTS API
-    response = client.models.generate_content(
-        model="gemini-3.1-flash-tts-preview",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=voice
-                    )
-                )
-            )
-        )
+    query = urlencode({"output_format": "pcm_24000"})
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{quote(voice, safe='')}?{query}"
+    payload = json.dumps({
+        "text": text,
+        "model_id": MODEL_ID,
+        "language_code": LANGUAGE_CODES[language],
+    }).encode("utf-8")
+    request = Request(
+        url,
+        data=payload,
+        headers={
+            "Accept": "application/octet-stream",
+            "Content-Type": "application/json",
+            "xi-api-key": api_key,
+        },
+        method="POST",
     )
 
-    # Extract the raw PCM audio bytes from the response
-    audio_bytes = response.candidates[0].content.parts[0].inline_data.data
-    return audio_bytes
+    try:
+        with urlopen(request, timeout=120) as response:
+            return response.read()
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"ElevenLabs API error ({exc.code}): {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Could not connect to ElevenLabs: {exc.reason}") from exc
 
 
 def pcm_to_wav(pcm_bytes, sample_rate=24000):
     """
-    Convert raw PCM bytes from Gemini TTS into a proper WAV file bytes object.
-    Gemini returns raw PCM at 24000Hz, 16-bit, mono — we need to wrap it
+    Convert raw PCM bytes from ElevenLabs into a proper WAV file bytes object.
+    ElevenLabs returns raw PCM at 24000Hz, 16-bit, mono — we need to wrap it
     in a WAV header so pydub can read it.
 
     Parameters:
-        pcm_bytes   : raw audio bytes from Gemini API
-        sample_rate : Gemini TTS outputs at 24000Hz
+        pcm_bytes   : raw audio bytes from ElevenLabs API
+        sample_rate : ElevenLabs PCM output sample rate
 
     Returns:
         wav_bytes : properly formatted WAV bytes

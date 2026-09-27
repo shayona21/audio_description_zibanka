@@ -2,11 +2,13 @@
 
 import csv
 import io
+import json
+import os
 import tempfile
 import unittest
 import wave
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, patch
 
 from openpyxl import Workbook
 
@@ -28,19 +30,24 @@ class LanguageTests(unittest.TestCase):
         self.client = web.app.test_client()
         # A short, valid 24 kHz mono PCM clip replaces only the external API.
         self.pcm = b"\x01\x00" * 2400
-        self.api = Mock()
-        self.api.models.generate_content.return_value.candidates = [
-            Mock(content=Mock(parts=[Mock(inline_data=Mock(data=self.pcm))]))
-        ]
-        patcher = patch.object(tts.genai, "Client", return_value=self.api)
-        self.client_factory = patcher.start()
+        self.response = MagicMock()
+        self.response.__enter__.return_value = self.response
+        self.response.read.return_value = self.pcm
+        patcher = patch.object(tts, "urlopen", return_value=self.response)
+        self.urlopen = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.dict(os.environ, {"ELEVENLABS_API_KEY": "test-api-key"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(tts, "DEFAULT_VOICE", "test-voice-id")
+        patcher.start()
         self.addCleanup(patcher.stop)
 
     def upload(self, language=None, file_bytes=b"test", filename="script.csv"):
         data = {
             "file": (io.BytesIO(file_bytes), filename),
             "output_name": "track",
-            "voice": "Aoede",
+            "voice": "test-voice-id",
         }
         if language is not None:
             data["language"] = language
@@ -56,7 +63,7 @@ class LanguageTests(unittest.TestCase):
             thread.assert_not_called()
         self.assertFalse(web.jobs)
         self.assertEqual(list(self.directory.iterdir()), [])
-        self.client_factory.assert_not_called()
+        self.urlopen.assert_not_called()
 
     def test_default_and_selected_language_reach_worker_and_status(self):
         with patch.object(web.threading, "Thread") as thread:
@@ -69,19 +76,25 @@ class LanguageTests(unittest.TestCase):
 
     def test_tts_defaults_and_request_language_are_independent(self):
         for language in tts.AVAILABLE_LANGUAGES:
-            self.assertEqual(tts.text_to_speech("script", "Aoede", language), self.pcm)
-            call = self.api.models.generate_content.call_args.kwargs
-            self.assertIn(f"neutral {language} narration", call["contents"])
-            self.assertEqual(call["config"].speech_config.voice_config.prebuilt_voice_config.voice_name, "Aoede")
+            self.assertEqual(tts.text_to_speech("script", "test-voice-id", language), self.pcm)
+            request = self.urlopen.call_args.args[0]
+            payload = json.loads(request.data)
+            self.assertEqual(payload["text"], "script")
+            self.assertEqual(payload["language_code"], tts.LANGUAGE_CODES[language])
+            self.assertEqual(payload["model_id"], tts.MODEL_ID)
+            self.assertIn("/test-voice-id?", request.full_url)
+            self.assertIn("output_format=pcm_24000", request.full_url)
+            self.assertEqual(request.get_header("Xi-api-key"), "test-api-key")
         tts.text_to_speech("विवरण")
-        self.assertEqual(
-            self.api.models.generate_content.call_args.kwargs["contents"],
-            "Speak in a calm, clear, neutral Hindi narration tone for audio description: विवरण",
-        )
-        self.client_factory.reset_mock()
+        self.assertEqual(json.loads(self.urlopen.call_args.args[0].data)["text"], "विवरण")
+        self.urlopen.reset_mock()
         with self.assertRaises(ValueError):
             tts.text_to_speech("script", language="invalid")
-        self.client_factory.assert_not_called()
+        self.urlopen.assert_not_called()
+        with patch.dict(os.environ, {"ELEVENLABS_API_KEY": ""}):
+            with self.assertRaisesRegex(RuntimeError, "ELEVENLABS_API_KEY"):
+                tts.text_to_speech("script", "test-voice-id")
+        self.urlopen.assert_not_called()
 
     def test_multilingual_csv_and_excel_uploads_complete_and_download(self):
         for extension, language, lines in (
@@ -104,7 +117,7 @@ class LanguageTests(unittest.TestCase):
                     workbook.save(buffer)
                     workbook.close()
                     data = buffer.getvalue()
-                self.api.models.generate_content.reset_mock()
+                self.urlopen.reset_mock()
                 with patch.object(web.threading, "Thread") as thread:
                     response = self.upload(language, data, f"script.{extension}")
                     self.assertEqual(response.status_code, 200)
@@ -114,11 +127,12 @@ class LanguageTests(unittest.TestCase):
                 status = self.client.get(f"/status/{job_id}").json
                 self.assertEqual(status["status"], "done", status.get("error"))
                 self.assertEqual(status["current"], len(lines))
-                calls = self.api.models.generate_content.call_args_list
+                calls = self.urlopen.call_args_list
                 self.assertEqual(len(calls), len(lines))
                 for call, line in zip(calls, lines):
-                    self.assertIn(f"neutral {language} narration", call.kwargs["contents"])
-                    self.assertTrue(call.kwargs["contents"].endswith(line))
+                    payload = json.loads(call.args[0].data)
+                    self.assertEqual(payload["text"], line)
+                    self.assertEqual(payload["language_code"], tts.LANGUAGE_CODES[language])
                 download = self.client.get(f"/download/{job_id}")
                 self.assertEqual(download.status_code, 200)
                 self.assertIn("track.wav", download.headers["Content-Disposition"])
@@ -135,13 +149,16 @@ class LanguageTests(unittest.TestCase):
              patch.object(main, "build_master_timeline"), \
              patch.object(main, "export_wav"), patch.object(main.time, "sleep"):
             main.run("script.csv", language="French")
-        self.assertIn("neutral French narration", self.api.models.generate_content.call_args.kwargs["contents"])
+        payload = json.loads(self.urlopen.call_args.args[0].data)
+        self.assertEqual(payload["language_code"], "fr")
+        self.assertEqual(payload["text"], "Une porte s’ouvre.")
 
     def test_page_lists_languages_with_hindi_selected(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         html = response.get_data(as_text=True)
         self.assertIn('id="language-select" name="language"', html)
+        self.assertIn('id="voice-select" name="voice"', html)
         self.assertIn('<option value="Hindi" selected>Hindi</option>', html)
         for language in tts.AVAILABLE_LANGUAGES:
             self.assertIn(f'value="{language}"', html)

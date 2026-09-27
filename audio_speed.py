@@ -1,4 +1,4 @@
-"""Pitch-preserving tempo adjustment for individual Gemini WAV clips."""
+"""Pitch-preserving tempo adjustment for individual ElevenLabs WAV clips."""
 
 import math
 import shutil
