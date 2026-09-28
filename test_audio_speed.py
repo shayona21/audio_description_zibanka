@@ -1,6 +1,8 @@
 import io
+import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,6 +71,15 @@ class WebSpeedTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.client = web.app.test_client()
+        patcher = patch.dict(os.environ, {
+            "ELEVENLABS_API_KEY": "test-api-key",
+            "GEMINI_API_KEY": "test-gemini-key",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        voice_patcher = patch("tts_client.DEFAULT_VOICE", "test-voice-id")
+        voice_patcher.start()
+        self.addCleanup(voice_patcher.stop)
 
     def upload(self, speed=None):
         data = {
@@ -98,11 +109,11 @@ class WebSpeedTests(unittest.TestCase):
             self.assertFalse(web.jobs)
 
     def test_worker_adjusts_each_line_before_next_generation_and_downloads(self):
-        rows = [dict(row_number=i + 1, start_ms=i * 1000, text=str(i)) for i in range(2)]
+        rows = [dict(row_number=i + 1, start_ms=i * 2000, text=str(i)) for i in range(2)]
         original = Sine(440, sample_rate=24000).to_audio_segment(duration=1200)
         events = []
 
-        def generate(text, voice, language):
+        def generate(text, voice, language, provider):
             events.append("generate")
             return original.raw_data
 
@@ -113,7 +124,7 @@ class WebSpeedTests(unittest.TestCase):
         lengths = []
         for speed in (1.0, MAX_SPEED_RATE):
             events.clear()
-            web.jobs["test"] = {"progress": [], "download_name": "track.wav"}
+            web.jobs["test"] = {"progress": [], "download_name": "track.zip"}
             with patch.object(web, "parse_file", return_value=rows), \
                  patch.object(web, "text_to_speech", side_effect=generate), \
                  patch.object(web, "adjust_audio_speed", side_effect=adjust):
@@ -122,9 +133,85 @@ class WebSpeedTests(unittest.TestCase):
             self.assertEqual(web.jobs["test"]["status"], "done")
             response = self.client.get("/download/test")
             self.assertEqual(response.status_code, 200)
-            lengths.append(len(AudioSegment.from_wav(io.BytesIO(response.data))))
+            with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+                self.assertEqual(archive.namelist(), ["Row_1_2.wav"])
+                lengths.append(
+                    len(AudioSegment.from_wav(io.BytesIO(archive.read("Row_1_2.wav"))))
+                )
             response.close()
-        self.assertEqual(lengths, [121000, 121000])
+        self.assertEqual(lengths, [3200, 3002])
+
+    def test_worker_warns_when_generated_speech_exceeds_row_window(self):
+        row = {
+            "row_number": 5,
+            "start_ms": 22120,
+            "end_ms": 24160,
+            "duration_ms": 2040,
+            "text": "सरस्वती अपने केबिन में हिमांशु के साथ है।",
+        }
+        web.jobs["test"] = {"progress": []}
+        pcm = b"\x00\x00" * (24000 * 3)
+        with patch.object(web, "parse_file", return_value=[row]), \
+               patch.object(web, "text_to_speech", return_value=pcm):
+            web.process_job("test", "script.csv")
+
+        self.assertEqual(web.jobs["test"]["status"], "done")
+        warning = next(
+            line for line in web.jobs["test"]["progress"]
+            if "DURATION OVERRUN" in line
+        )
+        self.assertIn("Row 5", warning)
+        self.assertIn("3.00s", warning)
+        self.assertIn("2.04s", warning)
+        self.assertIn("0.96s", warning)
+
+    def test_worker_splits_zip_after_each_overrun_row(self):
+        rows = [
+            {"row_number": 1, "start_ms": 0, "end_ms": 1000, "duration_ms": 1000, "text": "1"},
+            {"row_number": 2, "start_ms": 1000, "end_ms": 2000, "duration_ms": 1000, "text": "2"},
+            {"row_number": 3, "start_ms": 2000, "end_ms": 4040, "duration_ms": 2040, "text": "3"},
+            {"row_number": 4, "start_ms": 4040, "end_ms": 5040, "duration_ms": 1000, "text": "4"},
+            {"row_number": 5, "start_ms": 5040, "end_ms": 6040, "duration_ms": 1000, "text": "5"},
+        ]
+        durations_ms = {"1": 500, "2": 700, "3": 3000, "4": 400, "5": 1500}
+        web.jobs["test"] = {"progress": [], "download_name": "track.zip"}
+
+        def generate(text, voice, language, provider):
+            return b"\x00\x00" * (durations_ms[text] * 24)
+
+        with patch.object(web, "parse_file", return_value=rows), \
+             patch.object(web, "text_to_speech", side_effect=generate):
+            web.process_job("test", "script.csv")
+
+        self.assertEqual(web.jobs["test"]["status"], "done")
+        response = self.client.get("/download/test")
+        with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+            self.assertEqual(archive.namelist(), ["Row_1_3.wav", "Row_4_5.wav"])
+            segment_lengths = [
+                len(AudioSegment.from_wav(io.BytesIO(archive.read(name))))
+                for name in archive.namelist()
+            ]
+        self.assertEqual(segment_lengths, [5000, 2500])
+        response.close()
+
+    def test_worker_separates_actual_clip_collisions(self):
+        rows = [
+            {"row_number": 1, "start_ms": 0, "end_ms": 2000, "duration_ms": 2000, "text": "first"},
+            {"row_number": 2, "start_ms": 1000, "end_ms": 3000, "duration_ms": 2000, "text": "second"},
+        ]
+        pcm = b"\x00\x00" * (1200 * 24)
+        web.jobs["test"] = {"progress": [], "download_name": "track.zip"}
+        with patch.object(web, "parse_file", return_value=rows), \
+             patch.object(web, "text_to_speech", return_value=pcm):
+            web.process_job("test", "script.csv")
+
+        response = self.client.get("/download/test")
+        with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+            self.assertEqual(archive.namelist(), ["Row_1_1.wav", "Row_2_2.wav"])
+        self.assertTrue(any(
+            "OVERLAP DETECTED" in line for line in web.jobs["test"]["progress"]
+        ))
+        response.close()
 
     def test_processing_failure_marks_job_as_error(self):
         web.jobs["test"] = {"progress": []}

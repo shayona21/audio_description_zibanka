@@ -23,10 +23,11 @@ def build_master_timeline(
     The master duration is fixed regardless of individual clip durations.
     """
 
-    progress_callback(
-        f"Creating silent master timeline "
-        f"({episode_duration_ms / 1000 / 60:.1f} minutes)..."
-    )
+    if episode_duration_ms < 60000:
+        duration_label = f"{episode_duration_ms / 1000:.2f} seconds"
+    else:
+        duration_label = f"{episode_duration_ms / 1000 / 60:.1f} minutes"
+    progress_callback(f"Creating silent master timeline ({duration_label})...")
     master = AudioSegment.silent(
         duration=episode_duration_ms,
         frame_rate=SAMPLE_RATE
@@ -65,6 +66,41 @@ def build_master_timeline(
         )
 
     return master
+
+
+def audio_duration_ms(audio_bytes):
+    """Return the duration of a WAV clip in milliseconds."""
+    return len(AudioSegment.from_wav(io.BytesIO(audio_bytes)))
+
+
+def build_segment_timeline(ad_rows, audio_clips, progress_callback=print):
+    """Build a compact timeline rebased to the first row in a segment."""
+    if not ad_rows or len(ad_rows) != len(audio_clips):
+        raise ValueError("A segment requires matching non-empty rows and clips")
+
+    first_start_ms = ad_rows[0]["start_ms"]
+    segment_rows = [
+        {**row, "start_ms": row["start_ms"] - first_start_ms}
+        for row in ad_rows
+    ]
+    duration_ms = max(
+        row["start_ms"] + audio_duration_ms(clip)
+        for row, clip in zip(segment_rows, audio_clips)
+    )
+    return build_master_timeline(
+        segment_rows,
+        audio_clips,
+        duration_ms,
+        progress_callback=progress_callback,
+    )
+
+
+def export_wav_bytes(audio):
+    """Export an AudioSegment as in-memory WAV bytes."""
+    buffer = io.BytesIO()
+    audio.export(buffer, format="wav")
+    return buffer.getvalue()
+
 
 def export_wav(master, output_path, progress_callback=print):
     """

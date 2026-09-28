@@ -1,7 +1,7 @@
 # main.py
 # Ties everything together:
 # 1. Parse Excel
-# 2. Convert each row to speech via ElevenLabs TTS
+# 2. Convert each row to speech via the selected TTS provider
 # 3. Place each clip on master timeline
 # 4. Export as .wav
 
@@ -9,18 +9,23 @@ import os
 import time
 from dotenv import load_dotenv
 from excel_parser import parse_file
-from tts_client import DEFAULT_LANGUAGE, text_to_speech, pcm_to_wav, validate_language
+from tts_client import (
+    DEFAULT_LANGUAGE, DEFAULT_PROVIDER, text_to_speech, pcm_to_wav,
+    validate_language, validate_provider,
+)
 from audio_builder import build_master_timeline, export_wav
 from audio_speed import adjust_audio_speed, check_speed_support
 
 load_dotenv()
 
-def run(excel_path, output_path="output_AD.wav", speed=1.0, language=DEFAULT_LANGUAGE):
+def run(excel_path, output_path="output_AD.wav", speed=1.0,
+    language=DEFAULT_LANGUAGE, provider=DEFAULT_PROVIDER):
     """
     Full pipeline: Excel/CSV → .wav
     """
 
-    language = validate_language(language)
+    provider = validate_provider(provider)
+    language = validate_language(language, provider)
     speed = check_speed_support(speed)
 
     # Step 1: Parse the Excel file
@@ -39,7 +44,7 @@ def run(excel_path, output_path="output_AD.wav", speed=1.0, language=DEFAULT_LAN
         print(f"  Row {row['row_number']}/{len(rows)}: {row['text'][:40]}...")
 
         # Get raw PCM bytes from ElevenLabs TTS
-        pcm_bytes = text_to_speech(row["text"], language=language)
+        pcm_bytes = text_to_speech(row["text"], language=language, provider=provider)
 
         # Convert PCM → WAV so pydub can read it
         wav_bytes = pcm_to_wav(pcm_bytes)

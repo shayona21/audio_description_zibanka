@@ -297,7 +297,7 @@
             color: var(--muted);
         }
 
-        #voice-select {
+        #elevenlabs-voice-id {
             width: 100%;
             height: 48px;
             padding: 0 14px;
@@ -310,12 +310,12 @@
             transition: border-color 150ms ease, box-shadow 150ms ease;
         }
 
-        #voice-select:focus {
+        #elevenlabs-voice-id:focus {
             border-color: var(--brand);
             box-shadow: 0 0 0 3px rgba(4, 79, 137, 0.1);
         }
 
-        #voice-select::placeholder {
+        #elevenlabs-voice-id::placeholder {
             color: #9aa1a8;
         }
 
@@ -656,8 +656,8 @@
                 <p class="eyebrow">Audio workflow</p>
                 <h1 id="page-title">Create an audio description track.</h1>
                 <p class="subtitle">
-                    Add Excel or CSV files to generate a synchronized WAV file,
-                    ready for your production timeline.
+                    Add Excel or CSV files to generate non-overlapping WAV segments
+                    in a ZIP, ready for your production timeline.
                 </p>
             </section>
 
@@ -694,7 +694,18 @@
                             autocomplete="off"
                             spellcheck="false"
                         >
-                        <span class="file-extension" aria-hidden="true">.wav</span>
+                        <span class="file-extension" aria-hidden="true">.zip</span>
+                    </div>
+                </div>
+
+                <div class="output-field">
+                    <label class="field-label" for="provider-select">Text-to-speech provider</label>
+                    <div class="select-wrap">
+                        <select id="provider-select" name="provider">
+                            {% for provider, label in providers.items() %}
+                                <option value="{{ provider }}"{% if provider == default_provider %} selected{% endif %}>{{ label }}</option>
+                            {% endfor %}
+                        </select>
                     </div>
                 </div>
 
@@ -711,9 +722,20 @@
                 </div>
 
                 <div class="output-field">
-                    <label class="field-label" for="voice-select">ElevenLabs voice ID</label>
-                    <input id="voice-select" name="voice" type="text" value="{{ default_voice }}" placeholder="Enter a voice ID from your ElevenLabs account" required>
-                    <p class="voice-preview-note">
+                    <label class="field-label" id="voice-label" for="elevenlabs-voice-id">Narration voice</label>
+                    <div class="select-wrap" id="google-voice-field" hidden>
+                        <select id="google-voice-select" name="google_voice">
+                            {% for voice in google_voices %}
+                                <option value="{{ voice }}"{% if voice == default_google_voice %} selected{% endif %}>{{ voice }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <input id="elevenlabs-voice-id" name="elevenlabs_voice" type="text" value="{{ default_voice }}" placeholder="Enter an ElevenLabs voice ID" required>
+                    <p class="voice-preview-note" id="google-voice-help" hidden>
+                        Choose a prebuilt voice from Google Gemini.
+                        <a href="https://aistudio.google.com/generate-speech" target="_blank" rel="noopener noreferrer">Preview Gemini voices</a>.
+                    </p>
+                    <p class="voice-preview-note" id="elevenlabs-voice-help">
                         Find and preview voices in the
                         <a href="https://elevenlabs.io/voice-library" target="_blank" rel="noopener noreferrer">ElevenLabs Voice Library</a>.
                     </p>
@@ -751,8 +773,8 @@
                                 </svg>
                             </span>
                             <div>
-                                <h2>Your audio is ready</h2>
-                                <p id="output-file-name">audio_description.wav</p>
+                                <h2>Your audio files are ready</h2>
+                                <p id="output-file-name">audio_description.zip</p>
                             </div>
                         </div>
                         <a class="download-button" id="download-link" href="#">
@@ -760,7 +782,7 @@
                                 <path d="M12 3v12m0 0 4-4m-4 4-4-4"></path>
                                 <path d="M5 20h14"></path>
                             </svg>
-                            Download WAV
+                            Download ZIP
                         </a>
                     </div>
                 </section>
@@ -782,8 +804,16 @@
         const fileSizeEl = document.getElementById("file-size");
         const fileTypeEl = document.getElementById("file-type");
         const outputNameInput = document.getElementById("output-name");
-        const voiceSelect = document.getElementById("voice-select");
+        const providerSelect = document.getElementById("provider-select");
         const languageSelect = document.getElementById("language-select");
+        const googleVoiceField = document.getElementById("google-voice-field");
+        const googleVoiceSelect = document.getElementById("google-voice-select");
+        const elevenLabsVoiceInput = document.getElementById("elevenlabs-voice-id");
+        const googleVoiceHelp = document.getElementById("google-voice-help");
+        const elevenLabsVoiceHelp = document.getElementById("elevenlabs-voice-help");
+        const voiceLabel = document.getElementById("voice-label");
+        const languagesByProvider = {{ languages_by_provider | tojson }};
+        const defaultLanguage = {{ default_language | tojson }};
         const speedDial = document.getElementById("speed-dial");
         const speedValue = document.getElementById("speed-value");
         speedDial.addEventListener("input", () => {
@@ -822,7 +852,35 @@
         });
 
         outputNameInput.addEventListener("input", updateSubmitState);
+        providerSelect.addEventListener("change", updateProviderControls);
+        googleVoiceSelect.addEventListener("change", updateSubmitState);
+        elevenLabsVoiceInput.addEventListener("input", updateSubmitState);
         submitBtn.addEventListener("click", submitFile);
+        updateProviderControls();
+
+        function updateProviderControls() {
+            const provider = providerSelect.value;
+            const selectedLanguage = languageSelect.value;
+            const supportedLanguages = languagesByProvider[provider];
+            languageSelect.replaceChildren(...supportedLanguages.map(language => {
+                const option = document.createElement("option");
+                option.value = language;
+                option.textContent = language;
+                return option;
+            }));
+            languageSelect.value = supportedLanguages.includes(selectedLanguage)
+                ? selectedLanguage
+                : defaultLanguage;
+
+            const isGoogle = provider === "google";
+            googleVoiceField.hidden = !isGoogle;
+            googleVoiceHelp.hidden = !isGoogle;
+            elevenLabsVoiceInput.hidden = isGoogle;
+            elevenLabsVoiceHelp.hidden = isGoogle;
+            voiceLabel.htmlFor = isGoogle ? "google-voice-select" : "elevenlabs-voice-id";
+            voiceLabel.textContent = isGoogle ? "Google Gemini voice" : "ElevenLabs voice ID";
+            updateSubmitState();
+        }
 
         function selectFile(file) {
             const extension = file.name.split(".").pop().toLowerCase();
@@ -862,7 +920,10 @@
             const formData = new FormData();
             formData.append("file", selectedFile);
             formData.append("output_name", requestedOutputName);
-            formData.append("voice", voiceSelect.value);
+            formData.append("provider", providerSelect.value);
+            formData.append("voice", providerSelect.value === "google"
+                ? googleVoiceSelect.value
+                : elevenLabsVoiceInput.value);
             formData.append("language", languageSelect.value);
             formData.append("speed", speedDial.value);
 
@@ -889,7 +950,7 @@
                     progressLines.slice(lastLogCount).forEach(line => {
                         const isDone = line.startsWith("Complete");
                         const isError = line.startsWith("Error");
-                        const isWarning = line.includes("OVERLAP DETECTED");
+                        const isWarning = line.includes("OVERLAP DETECTED") || line.includes("DURATION OVERRUN");
                         const logClass = isDone ? "done" : isError ? "error" : isWarning ? "warning" : "";
                         appendLog(line, logClass);
                     });
@@ -951,13 +1012,18 @@
         }
 
         function updateSubmitState() {
-            submitBtn.disabled = !selectedFile || !outputNameInput.value.trim();
+            const voiceReady = providerSelect.value === "google"
+                ? Boolean(googleVoiceSelect.value)
+                : Boolean(elevenLabsVoiceInput.value.trim());
+            submitBtn.disabled = !selectedFile || !outputNameInput.value.trim() || !voiceReady;
         }
 
         function setInputsDisabled(disabled) {
             fileInput.disabled = disabled;
             outputNameInput.disabled = disabled;
-            voiceSelect.disabled = disabled;
+            providerSelect.disabled = disabled;
+            googleVoiceSelect.disabled = disabled;
+            elevenLabsVoiceInput.disabled = disabled;
             languageSelect.disabled = disabled;
             speedDial.disabled = disabled;
             uploadArea.classList.toggle("disabled", disabled);
