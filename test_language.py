@@ -93,6 +93,7 @@ class LanguageTests(unittest.TestCase):
         self.assertEqual(thread.call_args.kwargs["kwargs"], {
             "language": "Albanian",
             "provider": "google",
+            "output_mode": "split",
         })
 
     def test_google_provider_requires_its_own_api_key_before_job_creation(self):

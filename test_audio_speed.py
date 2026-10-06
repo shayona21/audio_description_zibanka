@@ -81,7 +81,7 @@ class WebSpeedTests(unittest.TestCase):
         voice_patcher.start()
         self.addCleanup(voice_patcher.stop)
 
-    def upload(self, speed=None):
+    def upload(self, speed=None, output_mode=None):
         data = {
             "file": (io.BytesIO(b"test"), "script.csv"),
             "output_name": "track",
@@ -89,7 +89,76 @@ class WebSpeedTests(unittest.TestCase):
         }
         if speed is not None:
             data["speed"] = speed
+        if output_mode is not None:
+            data["output_mode"] = output_mode
         return self.client.post("/upload", data=data)
+
+    def test_output_mode_validation_and_default(self):
+        with patch.object(web.threading, "Thread") as thread:
+            for mode in ("", "unknown"):
+                self.assertEqual(self.upload(output_mode=mode).status_code, 400)
+            thread.assert_not_called()
+            self.assertFalse(web.jobs)
+            self.assertEqual(list(Path(self.directory.name).iterdir()), [])
+            response = self.upload()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["download_name"], "track.zip")
+        self.assertEqual(thread.call_args.kwargs["kwargs"]["output_mode"], "split")
+
+    def test_both_output_modes_upload_generate_and_download(self):
+        script = (
+            "Start timecode,End timecode,Dialogue\n"
+            "00:00:01:00,00:00:01:10,first\n"
+            "00:00:02:00,00:00:02:10,last\n"
+        ).encode()
+        for mode in ("split", "full"):
+            # The long first clip outlasts both the last clip and end buffer.
+            for first_duration in (1200, 9000):
+                with self.subTest(mode=mode, first_duration=first_duration):
+                    clips = [
+                        Sine(440, sample_rate=24000).to_audio_segment(duration=first_duration),
+                        Sine(660, sample_rate=24000).to_audio_segment(duration=1000),
+                    ]
+                    extension = "wav" if mode == "full" else "zip"
+                    with patch.object(web.threading, "Thread") as thread:
+                        response = self.client.post("/upload", data={
+                            "file": (io.BytesIO(script), "script.csv"),
+                            "output_name": "track.zip" if mode == "full" else "track.wav",
+                            "voice": "test-voice-id", "output_mode": mode,
+                        })
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json["download_name"], f"track.{extension}")
+                    worker = thread.call_args.kwargs
+                    with patch.object(web, "text_to_speech", side_effect=[c.raw_data for c in clips]) as tts:
+                        worker["target"](*worker["args"], **worker["kwargs"])
+                    self.assertEqual(tts.call_count, 2)
+                    job_id = response.json["job_id"]
+                    status = self.client.get(f"/status/{job_id}").json
+                    self.assertEqual(status["status"], "done", status.get("error"))
+                    self.assertEqual(status["output_mode"], mode)
+                    download = self.client.get(f"/download/{job_id}")
+                    try:
+                        self.assertEqual(download.status_code, 200)
+                        self.assertIn(f"track.{extension}", download.headers["Content-Disposition"])
+                        if mode == "full":
+                            self.assertEqual(download.mimetype, "audio/wav")
+                            actual = AudioSegment.from_wav(io.BytesIO(download.data))
+                            expected = AudioSegment.silent(
+                                duration=max(7400, 1000 + first_duration), frame_rate=24000
+                            )
+                            expected = expected.overlay(clips[0], position=1000)
+                            expected = expected.overlay(clips[1], position=2000)
+                            self.assertEqual(actual.raw_data, expected.raw_data)
+                            self.assertFalse(any("Ending this WAV segment" in line for line in status["progress"]))
+                        else:
+                            self.assertEqual(download.mimetype, "application/zip")
+                            with zipfile.ZipFile(io.BytesIO(download.data)) as archive:
+                                self.assertEqual(archive.namelist(), ["Row_1_1.wav", "Row_2_2.wav"])
+                                for name, clip in zip(archive.namelist(), clips):
+                                    actual = AudioSegment.from_wav(io.BytesIO(archive.read(name)))
+                                    self.assertEqual(actual.raw_data, clip.raw_data)
+                    finally:
+                        download.close()
 
     def test_upload_validates_and_passes_speed_to_worker(self):
         with patch.object(web.threading, "Thread") as thread:
@@ -141,17 +210,21 @@ class WebSpeedTests(unittest.TestCase):
             response.close()
         self.assertEqual(lengths, [3200, 3002])
 
-    def test_worker_warns_when_generated_speech_exceeds_row_window(self):
+    def test_worker_warns_when_output_exceeds_next_dialogue_start(self):
         row = {
             "row_number": 5,
             "start_ms": 22120,
-            "end_ms": 24160,
-            "duration_ms": 2040,
+            "end_ms": 26120,
+            "duration_ms": 4000,
             "text": "सरस्वती अपने केबिन में हिमांशु के साथ है।",
         }
         web.jobs["test"] = {"progress": []}
         pcm = b"\x00\x00" * (24000 * 3)
-        with patch.object(web, "parse_file", return_value=[row]), \
+        next_row = {
+            "row_number": 6, "start_ms": 24160, "end_ms": 25160,
+            "duration_ms": 1000, "text": "next dialogue",
+        }
+        with patch.object(web, "parse_file", return_value=[row, next_row]), \
                patch.object(web, "text_to_speech", return_value=pcm):
             web.process_job("test", "script.csv")
 
@@ -163,7 +236,155 @@ class WebSpeedTests(unittest.TestCase):
         self.assertIn("Row 5", warning)
         self.assertIn("3.00s", warning)
         self.assertIn("2.04s", warning)
-        self.assertIn("0.96s", warning)
+        self.assertIn("0.960s", warning)
+        self.assertEqual(sum(
+            "DURATION OVERRUN" in line for line in web.jobs["test"]["progress"]
+        ), 1)
+
+    def test_worker_uses_next_start_for_csv_and_excel(self):
+        from openpyxl import Workbook
+
+        source_rows = [
+            ["Start timecode", "End timecode", "Dialogue"],
+            ["00:00:01:00", "00:00:01:10", "first"],
+            ["00:00:03:00", "00:00:03:10", "last"],
+        ]
+        csv_path = Path(self.directory.name) / "script.csv"
+        csv_path.write_text(
+            "\n".join(",".join(row) for row in source_rows), encoding="utf-8"
+        )
+        excel_path = Path(self.directory.name) / "script.xlsx"
+        workbook = Workbook()
+        for row in source_rows:
+            workbook.active.append(row)
+        workbook.save(excel_path)
+        workbook.close()
+
+        # Speech may exceed column 2 and still fit before the next start.
+        # Ending exactly at the next start is also not an overlap.
+        for path in (csv_path, excel_path):
+            for duration_ms in (1200, 2000, 2001, 2300):
+                with self.subTest(path=path.name, duration_ms=duration_ms):
+                    web.jobs["test"] = {"progress": []}
+                    pcm = b"\x00\x00" * (duration_ms * 24)
+                    with patch.object(web, "text_to_speech", return_value=pcm):
+                        web.process_job("test", str(path))
+                    self.assertEqual(web.jobs["test"]["status"], "done")
+                    overlaps = [
+                        line for line in web.jobs["test"]["progress"]
+                        if "OVERLAP DETECTED" in line
+                    ]
+                    self.assertEqual(len(overlaps), int(duration_ms == 2300))
+                    self.assertEqual(
+                        web.jobs["test"]["repaired_rows"], [1] if duration_ms == 2001 else []
+                    )
+                    with zipfile.ZipFile(web.jobs["test"]["output"]) as archive:
+                        self.assertEqual(archive.namelist(), (
+                            ["Row_1_1.wav", "Row_2_2.wav"]
+                            if duration_ms == 2300 else ["Row_1_2.wav"]
+                        ))
+
+    def test_worker_overlap_uses_output_length_after_speed_adjustment(self):
+        rows = [
+            dict(row_number=1, start_ms=0, end_ms=500, text="first"),
+            dict(row_number=2, start_ms=1100, end_ms=1600, text="last"),
+        ]
+        pcm = Sine(440, sample_rate=24000).to_audio_segment(duration=1200).raw_data
+        for speed, expected in (
+            (1.0, ["Row_1_2.wav"]),
+            (MAX_SPEED_RATE, ["Row_1_2.wav"]),
+        ):
+            with self.subTest(speed=speed):
+                web.jobs["test"] = {"progress": []}
+                with patch.object(web, "parse_file", return_value=rows), \
+                     patch.object(web, "text_to_speech", return_value=pcm):
+                    web.process_job("test", "script.csv", speed=speed)
+                self.assertEqual(web.jobs["test"]["status"], "done")
+                self.assertEqual(web.jobs["test"]["repaired_rows"], [1] if speed == 1.0 else [])
+                with zipfile.ZipFile(web.jobs["test"]["output"]) as archive:
+                    self.assertEqual(archive.namelist(), expected)
+
+    def test_worker_single_row_has_no_overlap_even_after_spreadsheet_end(self):
+        rows = [dict(row_number=1, start_ms=1000, end_ms=1500, text="only")]
+        web.jobs["test"] = {"progress": []}
+        with patch.object(web, "parse_file", return_value=rows), \
+             patch.object(web, "text_to_speech", return_value=b"\x00\x00" * 72000):
+            web.process_job("test", "script.csv")
+        self.assertEqual(web.jobs["test"]["status"], "done")
+        self.assertFalse(any(
+            "OVERLAP" in line or "OVERRUN" in line
+            for line in web.jobs["test"]["progress"]
+        ))
+        with zipfile.ZipFile(web.jobs["test"]["output"]) as archive:
+            self.assertEqual(archive.namelist(), ["Row_1_1.wav"])
+            clip = AudioSegment.from_wav(io.BytesIO(archive.read("Row_1_1.wav")))
+            self.assertEqual(len(clip), 3000)
+
+    def test_mixed_repairs_and_manual_flags_keep_selected_download_format(self):
+        rows = [
+            dict(row_number=1, start_ms=1000, end_ms=2000, text="repair"),
+            dict(row_number=2, start_ms=3800, end_ms=4800, text="manual"),
+            dict(row_number=3, start_ms=6500, end_ms=7000, text="last"),
+        ]
+        clips = [
+            Sine(frequency, sample_rate=24000).to_audio_segment(duration=duration)
+            for frequency, duration in ((440, 3000), (550, 3000), (660, 500))
+        ]
+        repaired = AudioSegment.from_wav(io.BytesIO(
+            adjust_audio_speed(wav(clips[0]), 3000 / 2800)
+        ))
+        for mode in ("split", "full"):
+            with self.subTest(mode=mode):
+                extension = "zip" if mode == "split" else "wav"
+                web.jobs["test"] = {"progress": [], "download_name": f"track.{extension}"}
+                with patch.object(web, "parse_file", return_value=rows), \
+                     patch.object(web, "text_to_speech", side_effect=[c.raw_data for c in clips]) as tts:
+                    web.process_job("test", "script.csv", output_mode=mode)
+                self.assertEqual(tts.call_count, 3)
+                status = self.client.get("/status/test").json
+                self.assertEqual(status["status"], "done", status.get("error"))
+                self.assertEqual(status["output_mode"], mode)
+                self.assertEqual(status["repaired_rows"], [1])
+                self.assertEqual(status["flagged_rows"], [2])
+                self.assertTrue(any("MANUAL FIX REQUIRED" in line for line in status["progress"]))
+                response = self.client.get("/download/test")
+                try:
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn(f"track.{extension}", response.headers["Content-Disposition"])
+                    if mode == "split":
+                        with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+                            self.assertEqual(archive.namelist(), ["Row_1_2.wav", "Row_3_3.wav"])
+                            expected = AudioSegment.silent(duration=5800, frame_rate=24000)
+                            expected = expected.overlay(repaired, position=0)
+                            expected = expected.overlay(clips[1], position=2800)
+                            actual = AudioSegment.from_wav(io.BytesIO(archive.read("Row_1_2.wav")))
+                            self.assertEqual(actual.raw_data, expected.raw_data)
+                    else:
+                        expected = AudioSegment.silent(duration=12000, frame_rate=24000)
+                        for position, clip in zip((1000, 3800, 6500), (repaired, clips[1], clips[2])):
+                            expected = expected.overlay(clip, position=position)
+                        actual = AudioSegment.from_wav(io.BytesIO(response.data))
+                        self.assertEqual(actual.raw_data, expected.raw_data)
+                finally:
+                    response.close()
+
+    def test_failed_automatic_repair_still_exports_for_manual_fix(self):
+        rows = [
+            dict(row_number=1, start_ms=0, end_ms=1000, text="first"),
+            dict(row_number=2, start_ms=2800, end_ms=3800, text="last"),
+        ]
+        clip = Sine(440, sample_rate=24000).to_audio_segment(duration=3000)
+        web.jobs["test"] = {"progress": []}
+        with patch.object(web, "parse_file", return_value=rows), \
+             patch.object(web, "text_to_speech", return_value=clip.raw_data), \
+             patch("audio_overlap.adjust_audio_speed", side_effect=RuntimeError("FFmpeg unavailable")):
+            web.process_job("test", "script.csv")
+        self.assertEqual(web.jobs["test"]["status"], "done")
+        self.assertEqual(web.jobs["test"]["flagged_rows"], [1])
+        with zipfile.ZipFile(web.jobs["test"]["output"]) as archive:
+            self.assertEqual(archive.namelist(), ["Row_1_1.wav", "Row_2_2.wav"])
+            actual = AudioSegment.from_wav(io.BytesIO(archive.read("Row_1_1.wav")))
+            self.assertEqual(actual.raw_data, clip.raw_data)
 
     def test_worker_splits_zip_after_each_overrun_row(self):
         rows = [

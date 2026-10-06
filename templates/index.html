@@ -656,8 +656,8 @@
                 <p class="eyebrow">Audio workflow</p>
                 <h1 id="page-title">Create an audio description track.</h1>
                 <p class="subtitle">
-                    Add Excel or CSV files to generate non-overlapping WAV segments
-                    in a ZIP, ready for your production timeline.
+                    Add Excel or CSV files to generate a full WAV track or split
+                    WAV segments in a ZIP, ready for your production timeline.
                 </p>
             </section>
 
@@ -683,6 +683,17 @@
                 </div>
 
                 <div class="output-field">
+                    <label class="field-label" for="output-mode">Download format</label>
+                    <div class="select-wrap">
+                        <select id="output-mode" name="output_mode" aria-describedby="output-mode-help">
+                            <option value="split" selected>Split at overlaps (ZIP)</option>
+                            <option value="full">Full audio with overlaps (WAV)</option>
+                        </select>
+                    </div>
+                    <p class="voice-preview-note" id="output-mode-help">Repairs small overlaps first, then starts a new WAV segment at each unresolved overlap for manual fixing. Downloads all segments in a ZIP.</p>
+                </div>
+
+                <div class="output-field">
                     <label class="field-label" for="output-name">Output file name</label>
                     <div class="name-input-wrap">
                         <input
@@ -694,7 +705,7 @@
                             autocomplete="off"
                             spellcheck="false"
                         >
-                        <span class="file-extension" aria-hidden="true">.zip</span>
+                        <span class="file-extension" id="output-extension" aria-hidden="true">.zip</span>
                     </div>
                 </div>
 
@@ -744,7 +755,8 @@
                 <div class="output-field">
                     <label class="field-label" for="speed-dial">Speed dial · <output id="speed-value" for="speed-dial">1.00x</output></label>
                     <input type="range" id="speed-dial" name="speed" min="1.00" max="{{ '%.2f' | format(max_speed_rate) }}" step="0.01" value="1.00" aria-describedby="speed-help">
-                    <p class="voice-preview-note" id="speed-help">1.00x–{{ '%.2f' | format(max_speed_rate) }}x. Higher speeds shorten each spoken line while preserving voice pitch. Scheduled start times and total track duration stay the same.</p>
+                    <p class="voice-preview-note" id="speed-help">1.00x–{{ '%.2f' | format(max_speed_rate) }}x. Higher speeds shorten each spoken line while preserving voice pitch. Scheduled start times stay the same.</p>
+                    <p class="voice-preview-note">Automatic overlap repair: overlaps under 10% of a clip's length are sped up to fit, with pitch preserved. Repair adds less than 1.20x speed on top of the dial setting. Anything that still overlaps is flagged for manual fixing.</p>
                 </div>
 
                 <button class="primary-button" id="submit-btn" type="button" disabled>
@@ -773,7 +785,7 @@
                                 </svg>
                             </span>
                             <div>
-                                <h2>Your audio files are ready</h2>
+                                <h2>Your audio is ready</h2>
                                 <p id="output-file-name">audio_description.zip</p>
                             </div>
                         </div>
@@ -782,7 +794,7 @@
                                 <path d="M12 3v12m0 0 4-4m-4 4-4-4"></path>
                                 <path d="M5 20h14"></path>
                             </svg>
-                            Download ZIP
+                            <span id="download-label">Download ZIP</span>
                         </a>
                     </div>
                 </section>
@@ -804,6 +816,18 @@
         const fileSizeEl = document.getElementById("file-size");
         const fileTypeEl = document.getElementById("file-type");
         const outputNameInput = document.getElementById("output-name");
+        const outputModeSelect = document.getElementById("output-mode");
+        const outputExtension = document.getElementById("output-extension");
+        const outputModeHelp = document.getElementById("output-mode-help");
+        function updateOutputMode() {
+            const isFull = outputModeSelect.value === "full";
+            outputExtension.textContent = isFull ? ".wav" : ".zip";
+            outputModeHelp.textContent = isFull
+                ? "Repairs small overlaps first, then downloads one continuous WAV on the original timeline, including leading silence. Unresolved overlaps are flagged and play together at their scheduled start times."
+                : "Repairs small overlaps first, then starts a new WAV segment at each unresolved overlap for manual fixing. Downloads all segments in a ZIP.";
+        }
+        outputModeSelect.addEventListener("change", updateOutputMode);
+        updateOutputMode();
         const providerSelect = document.getElementById("provider-select");
         const languageSelect = document.getElementById("language-select");
         const googleVoiceField = document.getElementById("google-voice-field");
@@ -920,6 +944,7 @@
             const formData = new FormData();
             formData.append("file", selectedFile);
             formData.append("output_name", requestedOutputName);
+            formData.append("output_mode", outputModeSelect.value);
             formData.append("provider", providerSelect.value);
             formData.append("voice", providerSelect.value === "google"
                 ? googleVoiceSelect.value
@@ -948,7 +973,7 @@
 
                     const progressLines = Array.isArray(data.progress) ? data.progress : [];
                     progressLines.slice(lastLogCount).forEach(line => {
-                        const isDone = line.startsWith("Complete");
+                        const isDone = line.startsWith("Complete") || line.startsWith("OVERLAP REPAIRED");
                         const isError = line.startsWith("Error");
                         const isWarning = line.includes("OVERLAP DETECTED") || line.includes("DURATION OVERRUN");
                         const logClass = isDone ? "done" : isError ? "error" : isWarning ? "warning" : "";
@@ -966,6 +991,8 @@
                         downloadSection.style.display = "block";
                         document.getElementById("download-link").href = "/download/" + jobId;
                         outputFileName.textContent = data.download_name;
+                        document.getElementById("download-label").textContent =
+                            data.output_mode === "full" ? "Download WAV" : "Download ZIP";
                         setInputsDisabled(false);
                         updateSubmitState();
                         submitLabel.textContent = "Generate another track";
@@ -1021,6 +1048,7 @@
         function setInputsDisabled(disabled) {
             fileInput.disabled = disabled;
             outputNameInput.disabled = disabled;
+            outputModeSelect.disabled = disabled;
             providerSelect.disabled = disabled;
             googleVoiceSelect.disabled = disabled;
             elevenLabsVoiceInput.disabled = disabled;

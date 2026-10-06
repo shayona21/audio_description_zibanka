@@ -19,7 +19,7 @@ PROVIDERS = {
     GOOGLE_PROVIDER: "Google Gemini",
 }
 
-# ElevenLabs Flash v2.5 language support, keyed by the UI's display names.
+# ElevenLabs languages offered in the UI, keyed by their display names.
 ELEVENLABS_LANGUAGE_CODES = {
     "Arabic": "ar", "Bulgarian": "bg", "Chinese (Mandarin)": "zh",
     "Croatian": "hr", "Czech": "cs", "Danish": "da", "Dutch": "nl",
@@ -65,7 +65,7 @@ GOOGLE_VOICES = [
     "Rasalgethi", "Sadachbia", "Sadaltager", "Schedar", "Sulafat",
     "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi", "Achernar",
 ]
-MODEL_ID = "eleven_flash_v2_5"
+MODEL_ID = "eleven_v4"
 GOOGLE_MODEL_ID = "gemini-3.8-flash-lite-tts"
 SAMPLE_RATE = 24000
 
