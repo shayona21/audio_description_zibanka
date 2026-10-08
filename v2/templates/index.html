@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Generate synchronized English dialogue tracks by episode and character.">
+    <title>AD version 2 | Zibanka</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+    <div class="page-shell">
+        <header class="site-header">
+            <div class="product-mark">Production tool</div>
+            <img
+                class="brand-logo"
+                src="{{ url_for('static', filename='zibanka_logo.jpeg') }}"
+                alt="Zibanka"
+            >
+        </header>
+
+        <main>
+            <section class="intro" aria-labelledby="page-title">
+                <p class="eyebrow">Audio workflow · AD version 2</p>
+                <h1 id="page-title">Create audio tracks by character.</h1>
+                <p class="subtitle">
+                    Upload your English dialogue workbook to generate a WAV for each
+                    episode and character, ready for your production timeline.
+                </p>
+            </section>
+
+            <section class="tool-card" aria-label="AD version 2 generator">
+                <form id="upload-form">
+                <input type="file" id="file-input" name="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" aria-describedby="template-help">
+                <label class="upload-area" id="upload-area" for="file-input">
+                    <span class="upload-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5"></path>
+                            <path d="M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"></path>
+                        </svg>
+                    </span>
+                    <span class="upload-title"><span>Choose an Excel file</span> or drag it here</span>
+                    <span class="upload-hint">Standardized dialogue workbook · .xlsx · Up to 20 MB</span>
+                </label>
+
+                <div class="file-selection" id="file-selection" aria-live="polite">
+                    <span class="file-type" id="file-type">FILE</span>
+                    <div class="file-details">
+                        <div id="file-name"></div>
+                        <div id="file-size"></div>
+                    </div>
+                </div>
+
+                <p class="voice-preview-note template-note" id="template-help">
+                    <a href="{{ url_for('template') }}">Download the Excel template</a>.
+                    Include EP NO, TCR IN, TCR OUT, CHARACTERS, VOICE ID, and ENGLISH DIALOGUES.
+                    SR NO and DUBBING STATUS are ignored.
+                </p>
+
+                <div class="output-field">
+                    <label class="field-label" for="output-name">Output file name</label>
+                    <div class="name-input-wrap">
+                        <input type="text" id="output-name" name="output_name" maxlength="70"
+                               value="AD_v2_output" placeholder="e.g. English dialogue AD v2"
+                               autocomplete="off" spellcheck="false" required>
+                        <span class="file-extension" aria-hidden="true">.zip</span>
+                    </div>
+                </div>
+
+                <div class="output-field">
+                    <label class="field-label" for="fps">Timecode frame rate</label>
+                    <div class="select-wrap">
+                        <select id="fps" name="fps" aria-describedby="fps-help">
+                            {% for fps in frame_rates %}
+                            <option value="{{ fps }}"{% if fps == 25 %} selected{% endif %}>{{ fps }} fps</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <p class="field-help" id="fps-help">Match your script’s frame rate. Timecodes use HH:MM:SS:FF, for example 00:00:18:08.</p>
+                </div>
+
+                <div class="output-field">
+                    <label class="field-label" for="sheet-name">Worksheet name <span class="field-help">(optional)</span></label>
+                    <input id="sheet-name" name="sheet" type="text" placeholder="First worksheet" aria-describedby="sheet-help">
+                    <p class="field-help" id="sheet-help">Leave blank to use the first worksheet in your workbook.</p>
+                </div>
+
+                <div class="output-field">
+                    <p class="field-label">English dialogue · ElevenLabs</p>
+                    <p class="voice-preview-note">Each line uses its VOICE ID from the workbook.
+                        Find and preview voices in the
+                        <a href="https://elevenlabs.io/voice-library" target="_blank" rel="noopener noreferrer">ElevenLabs Voice Library</a>.
+                    </p>
+                    <p class="voice-preview-note">Download one WAV per episode and character, plus a timing report, in a ZIP.
+                        Tracks start at 00:00:00:00 with silence between lines. Speech beyond TCR OUT is preserved and flagged for review.</p>
+                </div>
+
+                <button class="primary-button" id="submit-btn" type="submit" disabled>
+                    <span id="submit-label">Generate audio</span>
+                </button>
+                </form>
+
+                <section id="progress-section" aria-live="polite">
+                    <hr class="section-divider">
+                    <div class="progress-heading">
+                        <h2 id="progress-title">Generating audio</h2>
+                        <span id="progress-percent">0%</span>
+                    </div>
+                    <div id="progress-bar-wrap" role="progressbar" aria-label="Generation progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                        <div id="progress-bar"></div>
+                    </div>
+                    <div id="log" aria-label="Processing details"></div>
+                    <button class="secondary-button" id="retry-btn" type="button" hidden>Reconnect to job</button>
+                </section>
+
+                <section id="download-section" aria-live="polite">
+                    <hr class="section-divider">
+                    <div class="download-panel">
+                        <div class="download-copy">
+                            <span class="success-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="m5 12 4 4L19 6"></path>
+                                </svg>
+                            </span>
+                            <div>
+                                <h2>Your audio is ready</h2>
+                                <p id="output-file-name">AD_v2_output.zip</p>
+                                <p id="review-summary"></p>
+                            </div>
+                        </div>
+                        <a class="download-button" id="download-link" href="#">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M12 3v12m0 0 4-4m-4 4-4-4"></path>
+                                <path d="M5 20h14"></path>
+                            </svg>
+                            <span id="download-label">Download ZIP</span>
+                        </a>
+                    </div>
+                </section>
+            </section>
+
+            <p class="page-footer">Zibanka Audio Description · Version 2</p>
+        </main>
+    </div>
+
+</body>
+</html>
