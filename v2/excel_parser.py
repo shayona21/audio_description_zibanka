@@ -9,11 +9,11 @@ from openpyxl import load_workbook
 from .models import DialogueRow
 
 REQUIRED_HEADERS = (
-    "EP NO", "TCR IN", "TCR OUT", "CHARACTERS", "VOICE ID", "ENGLISH DIALOGUES",
+    "EP NO", "TCR IN", "TCR OUT", "CHARACTERS", "VOICE ID", "TARGET DIALOGUE",
 )
 TEMPLATE_HEADERS = (
     "EP NO", "SR NO", "TCR IN", "TCR OUT", "CHARACTERS", "VOICE ID",
-    "ENGLISH DIALOGUES", "DUBBING STATUS",
+    "TARGET DIALOGUE", "DUBBING STATUS",
 )
 SUPPORTED_FPS = (24, 25, 30, 50, 60)
 
@@ -75,6 +75,9 @@ def parse_excel(path, fps=25, sheet_name=None):
                      for name, index in columns.items()}
             if not any(cell_text(value) for value in cells.values()):
                 continue
+            # A missing voice marks a row that should not be synthesized.
+            if not cell_text(cells["VOICE ID"]):
+                continue
             missing = [name for name, value in cells.items() if not cell_text(value)]
             if missing:
                 errors.append(f"Row {number}: missing {', '.join(missing)}")
@@ -94,7 +97,7 @@ def parse_excel(path, fps=25, sheet_name=None):
                 continue
             row = DialogueRow(number, cell_text(cells["EP NO"]),
                               cell_text(cells["CHARACTERS"]), start, end,
-                              cell_text(cells["ENGLISH DIALOGUES"]),
+                              cell_text(cells["TARGET DIALOGUE"]),
                               cell_text(cells["VOICE ID"]))
             if row.group in voices and voices[row.group] != row.voice_id:
                 errors.append(f"Row {number}: conflicting VOICE ID for episode {row.episode}, character {row.character}")

@@ -31,11 +31,11 @@ Upload `.xlsx`, with headers in row 1. The first worksheet is used unless a work
 | TCR IN | Start time, e.g. `00:00:18:08` |
 | TCR OUT | End time, strictly later than start |
 | CHARACTERS | Character name |
-| VOICE ID | ElevenLabs voice ID for this row |
-| ENGLISH DIALOGUES | English text to synthesize |
+| VOICE ID | ElevenLabs voice ID; rows with an empty or whitespace-only value are skipped |
+| TARGET DIALOGUE | Text to synthesize |
 | DUBBING STATUS | Ignored, including any completion status |
 
-Every dialogue row must supply all six required fields. No implicit fill-down or merged-cell inheritance. Blank rows (across required fields) are skipped. Formulas in required fields are rejected: paste their values instead. Conflicting voice IDs within one episode/character pair are rejected. Episode and character grouping is case-sensitive after trimming surrounding whitespace. Ignored columns may be omitted.
+Rows with an empty or whitespace-only VOICE ID are skipped before validation and speech generation. Remaining dialogue rows must supply all six required fields. No implicit fill-down or merged-cell inheritance. Blank rows (across required fields) are skipped. If no rows remain, validation reports that no dialogue rows were found without calling ElevenLabs. Formulas in required fields are rejected: paste their values instead. Conflicting voice IDs within one episode/character pair are rejected. Episode and character grouping is case-sensitive after trimming surrounding whitespace. Ignored columns may be omitted.
 
 Text timecodes are `HH:MM:SS:FF`, default 25 fps; 24/30/50/60 fps can also be selected. Native Excel time cells are accepted at their stored time precision. Drop-frame notation is not supported. Timelines start at zero: a `01:00:00:00` timecode includes an hour of leading silence.
 

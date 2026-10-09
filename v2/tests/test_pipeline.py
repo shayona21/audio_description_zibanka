@@ -63,7 +63,7 @@ class PipelineTests(unittest.TestCase):
     def test_validation_reports_all_bad_rows_before_any_api_call(self):
         path = self.workbook([
             dialogue(),
-            dialogue(voice=""),
+            dialogue(character=""),
             dialogue(start="00:00:01:25"),
             dialogue(end="00:00:00:00"),
         ])
@@ -82,7 +82,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_missing_duplicate_headers_empty_sheet_and_formulas(self):
         for headers, rows, message in [
-            (TEMPLATE_HEADERS[:-2], [], "Missing required header: ENGLISH DIALOGUES"),
+            (TEMPLATE_HEADERS[:-2], [], "Missing required header: TARGET DIALOGUE"),
             (TEMPLATE_HEADERS + ("EP NO",), [], "Duplicate header"),
             (TEMPLATE_HEADERS, [], "No dialogue rows"),
             (TEMPLATE_HEADERS, [dialogue(text='="Hello"')], "paste values"),
@@ -212,13 +212,36 @@ class PipelineTests(unittest.TestCase):
         synthesize = Mock()
         app = create_app({"TESTING": True, "RUNTIME_DIR": self.root / "runtime", "SYNTHESIZE": synthesize})
         client = app.test_client()
-        path = self.workbook([dialogue(voice="")])
+        path = self.workbook([dialogue(character="")])
         response = client.post("/upload", data={"file": (io.BytesIO(path.read_bytes()), "input.xlsx")})
         self.assertEqual(response.status_code, 400)
-        self.assertIn("VOICE ID", response.json["error"])
+        self.assertIn("CHARACTERS", response.json["error"])
         synthesize.assert_not_called()
         response = client.post("/upload", data={"file": (io.BytesIO(b"broken"), "input.xlsx")})
         self.assertEqual(response.status_code, 400)
+
+    def test_blank_voice_rows_are_skipped_before_validation_and_generation(self):
+        path = self.workbook([
+            dialogue(voice=None, start="invalid", text="Skip empty cell"),
+            dialogue(voice="", character="", text="Skip empty string"),
+            dialogue(voice=" \t ", text="Skip whitespace"),
+            dialogue(text="Generate this"),
+        ])
+        rows = parse_excel(path)
+        self.assertEqual([row.row_number for row in rows], [5])
+        synthesize = Mock(return_value=wav_bytes())
+        summary = run_pipeline(path, self.root / "skipped.zip", synthesize=synthesize,
+                               progress=lambda _: None)
+        synthesize.assert_called_once_with("Generate this", "alice-voice")
+        self.assertEqual(summary["rows"], 1)
+        self.assertEqual(summary["tracks"], 1)
+
+    def test_all_blank_voices_produce_no_api_calls(self):
+        path = self.workbook([dialogue(voice=None), dialogue(voice="  ")])
+        synthesize = Mock()
+        with self.assertRaisesRegex(WorkbookValidationError, "No dialogue rows found"):
+            run_pipeline(path, self.root / "empty.zip", synthesize=synthesize)
+        synthesize.assert_not_called()
 
     def test_elevenlabs_request_uses_row_voice_and_converts_pcm(self):
         response = Mock()
