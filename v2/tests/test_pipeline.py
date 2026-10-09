@@ -15,7 +15,7 @@ from v2.app import create_app
 from v2.excel_parser import TEMPLATE_HEADERS, WorkbookValidationError, parse_excel, timecode_to_ms
 from v2.exporter import track_names
 from v2.pipeline import run_pipeline
-from v2.tts_client import ElevenLabsClient
+from v2.tts_client import MODEL_ID, ElevenLabsClient
 
 
 def wav_bytes(duration_ms=200, value=1000):
@@ -225,11 +225,15 @@ class PipelineTests(unittest.TestCase):
         response.read.return_value = b"\x00\x00" * 240
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
-        with patch("v2.tts_client.urlopen", return_value=response) as request:
-            result = ElevenLabsClient(api_key="test-key", model_id="eleven_multilingual_v2")("English dialogue", "voice/id")
+        with patch("v2.tts_client.urlopen", return_value=response) as request, \
+                patch.dict("os.environ", {"AD_V2_MODEL_ID": "ignored-legacy-override"}):
+            result = ElevenLabsClient(api_key="test-key")("English dialogue", "voice/id")
         sent = request.call_args.args[0]
         self.assertIn("voice%2Fid?output_format=pcm_24000", sent.full_url)
-        self.assertEqual(json.loads(sent.data), {"text": "English dialogue", "model_id": "eleven_multilingual_v2"})
+        self.assertEqual(json.loads(sent.data), {
+            "text": "English dialogue", "model_id": MODEL_ID,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        })
         with wave.open(io.BytesIO(result)) as wav:
             self.assertEqual(wav.getnframes(), 240)
             self.assertEqual(wav.getframerate(), 24000)

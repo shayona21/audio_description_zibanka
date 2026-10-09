@@ -9,20 +9,25 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 SAMPLE_RATE = 24000
-DEFAULT_MODEL = "eleven_multilingual_v2"
+# Single source of model selection for the V2 pipeline.
+MODEL_ID = "eleven_v4"
+VOICE_SETTINGS = {"stability": 0.5, "similarity_boost": 0.75}
 
 
 class ElevenLabsClient:
-    def __init__(self, api_key=None, model_id=None):
+    def __init__(self, api_key=None):
         self.api_key = (api_key or os.environ.get("ELEVENLABS_API_KEY", "")).strip()
-        self.model_id = (model_id or os.environ.get("AD_V2_MODEL_ID", DEFAULT_MODEL)).strip()
         if not self.api_key:
             raise ValueError("Set ELEVENLABS_API_KEY in v2/.env or the environment")
 
     def __call__(self, text, voice_id):
         request = Request(
             f"https://api.elevenlabs.io/v1/text-to-speech/{quote(voice_id, safe='')}?output_format=pcm_24000",
-            data=json.dumps({"text": text, "model_id": self.model_id}).encode("utf-8"),
+            data=json.dumps({
+                "text": text,
+                "model_id": MODEL_ID,
+                "voice_settings": VOICE_SETTINGS,
+            }).encode("utf-8"),
             headers={"Content-Type": "application/json", "Accept": "application/octet-stream",
                      "xi-api-key": self.api_key}, method="POST",
         )

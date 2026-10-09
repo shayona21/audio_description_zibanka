@@ -18,7 +18,7 @@ Set `ELEVENLABS_API_KEY` in `v2/.env`, then run:
 v2/.venv/bin/python -m v2.app
 ```
 
-Open http://127.0.0.1:5071. The original application can continue on port 5070. V2 reads only its own `.env` plus environment variables. It uses ElevenLabs Multilingual v2 by default; override `AD_V2_MODEL_ID` if needed. English dialogue is sent verbatim; no translation is performed. The API integration follows the [ElevenLabs create speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert). No FFmpeg is needed for this WAV-only pipeline.
+Open http://127.0.0.1:5071. The original application can continue on port 5070. V2 reads its API key and port from its own `.env` plus environment variables. Model selection is defined only by `MODEL_ID` in `v2/tts_client.py`; environment variables and constructor arguments cannot override it. Every request includes the `VOICE_SETTINGS` from that file: stability 0.5 and similarity boost 0.75. English dialogue is sent verbatim; no translation is performed. The API integration follows the [ElevenLabs create speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert). No FFmpeg is needed for this WAV-only pipeline.
 
 ## Spreadsheet contract
 
