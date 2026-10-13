@@ -41,6 +41,8 @@ Text timecodes are `HH:MM:SS:FF`, default 25 fps; 24/30/50/60 fps can also be se
 
 ## Output and timing
 
+Tag-only dialogue cells such as `[Gasps]` are sent as `[Gasps] ...` to supply punctuation outside the tags for the API's empty-text check. Tags and spoken words are preserved; rows already containing dialogue or punctuation are unchanged. This is a compatibility workaround, not a guaranteed provider behavior: verify acceptance and listen to a sample with your selected voice before a full run. Delivery cues such as `[Conversational tone]` alone do not specify a vocal sound. Detailed provider errors remain visible if the request is rejected.
+
 The ZIP contains `Episode_<episode>_<character>.wav` for each pair, plus `processing_report.csv`. Filenames are sanitized and disambiguated so characters cannot overwrite each other. Audio is mono 24 kHz, 16-bit PCM.
 
 Each line starts at TCR IN with silence between lines. All tracks for an episode have the same length: the latest TCR OUT or actual speech end across that episode. The spreadsheet does not supply a separate full episode duration. Input rows need not be sorted. Speech is never truncated or accelerated. Overruns past TCR OUT and actual overlaps within a character's track are flagged in the report; simultaneous speech by different characters is allowed. Overlapping speech within a track is mixed and may need manual correction.

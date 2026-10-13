@@ -6,6 +6,7 @@ import struct
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 import wave
 import zipfile
 
@@ -15,7 +16,7 @@ from v2.app import create_app
 from v2.excel_parser import TEMPLATE_HEADERS, WorkbookValidationError, parse_excel, timecode_to_ms
 from v2.exporter import track_names
 from v2.pipeline import run_pipeline
-from v2.tts_client import MODEL_ID, ElevenLabsClient
+from v2.tts_client import MODEL_ID, ElevenLabsClient, prepare_speech_text
 
 
 def wav_bytes(duration_ms=200, value=1000):
@@ -260,6 +261,58 @@ class PipelineTests(unittest.TestCase):
         with wave.open(io.BytesIO(result)) as wav:
             self.assertEqual(wav.getnframes(), 240)
             self.assertEqual(wav.getframerate(), 24000)
+
+    def test_tag_only_rows_get_punctuation_without_added_dialogue(self):
+        samples = (
+            ("[Gasps]", "[Gasps] ..."),
+            ("[LAUGHING]", "[LAUGHING] ..."),
+            ("[sighs] [laughs]", "[sighs] [laughs] ..."),
+            ("[Gasps] Oh no.", "[Gasps] Oh no."),
+        )
+        for index, (text, expected) in enumerate(samples):
+            with self.subTest(text=text):
+                path = self.workbook([dialogue(text=text)])
+                response = Mock()
+                response.read.return_value = b"\x00\x00" * 240
+                response.__enter__ = Mock(return_value=response)
+                response.__exit__ = Mock(return_value=False)
+                with patch("v2.tts_client.urlopen", return_value=response) as request:
+                    run_pipeline(path, self.root / f"sample-{index}.zip",
+                                 synthesize=ElevenLabsClient(api_key="test-key"),
+                                 progress=lambda _: None)
+                self.assertEqual(json.loads(request.call_args.args[0].data)["text"], expected)
+
+    def test_tag_punctuation_is_idempotent_and_preserves_spoken_text(self):
+        for text in ("Hello.", "[Gasps] Oh no.", "[laughing] ...", "[Unclosed tag", ""):
+            with self.subTest(text=text):
+                self.assertEqual(prepare_speech_text(text), text)
+        self.assertEqual(prepare_speech_text("  [LAUGHING] \n"), "  [LAUGHING] ...")
+        prepared = prepare_speech_text("[Gasps]")
+        self.assertEqual(prepare_speech_text(prepared), prepared)
+
+    def test_provider_error_reason_is_reported_with_row_and_credentials_redacted(self):
+        path = self.workbook([dialogue(text="[Gasps]")])
+        body = json.dumps({"detail": {"status": "example_provider_code",
+                                     "message": "Example reason test-key"}}).encode()
+        error = HTTPError("https://api.elevenlabs.io", 400, "Bad Request", {}, io.BytesIO(body))
+        with patch("v2.tts_client.urlopen", side_effect=error) as request:
+            with self.assertRaises(RuntimeError) as caught:
+                run_pipeline(path, self.root / "error.zip",
+                             synthesize=ElevenLabsClient(api_key="test-key"),
+                             progress=lambda _: None)
+        message = str(caught.exception)
+        self.assertIn("Excel row 2", message)
+        self.assertIn("HTTP 400", message)
+        self.assertIn("example_provider_code: Example reason [redacted]", message)
+        self.assertNotIn("test-key", message)
+        self.assertEqual(request.call_count, 1)
+
+    def test_non_json_error_response_is_not_reflected(self):
+        error = HTTPError("https://api.elevenlabs.io", 502, "Bad Gateway", {},
+                          io.BytesIO(b"<html>Unexpected proxy response</html>"))
+        with patch("v2.tts_client.urlopen", side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 502.*no structured error details"):
+                ElevenLabsClient(api_key="test-key")("[Gasps]", "voice-id")
 
 
 if __name__ == "__main__":
