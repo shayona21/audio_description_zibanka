@@ -18,7 +18,9 @@ Set `ELEVENLABS_API_KEY` in `v2/.env`, then run:
 v2/.venv/bin/python -m v2.app
 ```
 
-Open http://127.0.0.1:5071. The original application can continue on port 5070. V2 reads its API key and port from its own `.env` plus environment variables. Model selection is defined only by `MODEL_ID` in `v2/tts_client.py`; environment variables and constructor arguments cannot override it. Every request includes the `VOICE_SETTINGS` from that file: stability 0.5 and similarity boost 0.75. English dialogue is sent verbatim; no translation is performed. The API integration follows the [ElevenLabs create speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert). No FFmpeg is needed for this WAV-only pipeline.
+Open http://127.0.0.1:5071. The original application can continue on port 5070. V2 reads its API key and port from its own `.env` plus environment variables. Model selection is defined only by `MODEL_ID` in `v2/tts_client.py`; environment variables and constructor arguments cannot override it. Every request includes the `VOICE_SETTINGS` from that file: stability 0.5 and similarity boost 0.75. English dialogue is sent verbatim; no translation is performed. The API integration follows the [ElevenLabs create speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
+
+The speed dial ranges from **1.00x to 1.20x**, in 0.01x steps, with 1.00x as the default. Faster settings use FFmpeg to shorten each generated clip while preserving pitch, before calculating each character's independent timeline. Install FFmpeg and ensure `ffmpeg` is on PATH to use speeds above 1.00x. Missing FFmpeg is reported before any speech generation. At 1.00x the generated audio passes through unchanged and FFmpeg is not needed. Faster speech can reduce or eliminate delays; no line starts before its original script time.
 
 ## Spreadsheet contract
 
@@ -43,9 +45,28 @@ Text timecodes are `HH:MM:SS:FF`, default 25 fps; 24/30/50/60 fps can also be se
 
 Tag-only dialogue cells such as `[Gasps]` are sent as `[Gasps] ...` to supply punctuation outside the tags for the API's empty-text check. Tags and spoken words are preserved; rows already containing dialogue or punctuation are unchanged. This is a compatibility workaround, not a guaranteed provider behavior: verify acceptance and listen to a sample with your selected voice before a full run. Delivery cues such as `[Conversational tone]` alone do not specify a vocal sound. Detailed provider errors remain visible if the request is rejected.
 
-The ZIP contains `Episode_<episode>_<character>.wav` for each pair, plus `processing_report.csv`. Filenames are sanitized and disambiguated so characters cannot overwrite each other. Audio is mono 24 kHz, 16-bit PCM.
+The ZIP contains `Episode_<episode>_<character>.wav` for each pair, one `Episode_<episode>_timeline.csv` combining all characters in adjusted chronological order for each episode (source Excel row breaks ties), plus `processing_report.csv`. Filenames are sanitized and disambiguated so outputs cannot overwrite each other. Audio is mono 24 kHz, 16-bit PCM.
 
-Each line starts at TCR IN with silence between lines. All tracks for an episode have the same length: the latest TCR OUT or actual speech end across that episode. The spreadsheet does not supply a separate full episode duration. Input rows need not be sorted. Speech is never truncated or accelerated. Overruns past TCR OUT and actual overlaps within a character's track are flagged in the report; simultaneous speech by different characters is allowed. Overlapping speech within a track is mixed and may need manual correction.
+Timing is calculated independently for each **episode + character** pair. Within each pair, rows are ordered by original TCR IN, with Excel row number breaking ties; input rows need not be sorted. Each character's first line retains its original start. Every later line starts at `max(original TCR IN, previous actual audio end)`, using only that character's preceding line in the same episode. When a clip reaches past the next scripted start, the next line follows immediately after it. Available silence absorbs overruns, allowing later lines to return to their original start times. The script's TCR OUT is used for duration reporting, not to schedule the next line. Different characters may speak simultaneously; their durations and delays never alter each other's placements. Episodes are adjusted independently. Speech is never truncated. Audio placements, timeline CSVs, and processing report durations all reflect the selected speed.
+
+For example, if A's first line finishes at 00:15, A's next 00:40 line stays at 00:40. If A's first line instead finishes at 00:45, the next line starts immediately at 00:45. B's 00:11–00:14 slot starts at 00:11 in both cases, even while A is speaking. A longer or shorter B clip has no effect on A's start times.
+
+All tracks for an episode start at zero and have the same length: the latest original TCR OUT or actual audio end in that episode, whichever is later. This retains leading silence and all speech. The spreadsheet does not supply a separate full episode duration. Each combined timeline CSV has exactly six columns: **Dialogue, Original time start, Original time end, Adjusted time start, Adjusted time end, Delay**. Dialogue includes the speaker, e.g. `A: Hey, lets go on a walk`. Readable timestamps use `HH:MM:SS.mmm` (not frame-based input timecodes), and delay is shown in seconds, e.g. `5.000 s`. Adjusted end is the actual audio end.
+
+`processing_report.csv` uses this exact column order:
+
+```text
+excel_row,episode,character,voice_id,start_TCR,end_TCR,duration,actual_duration_ms,overrun_amnt_ms,status,track,adjusted_start_TCR,adjusted_end_TCR
+```
+
+- `excel_row` identifies the original Excel row; records retain source row order across episodes.
+- `start_TCR` and `end_TCR` show the original script times as `HH:MM:SS:FF` at the selected frame rate.
+- `duration` is the original scripted end minus start, **in milliseconds**.
+- `actual_duration_ms` is the measured audio length **after speed adjustment**.
+- `overrun_amnt_ms` is `max(0, actual_duration_ms − duration)`. It does not include delays caused by that character's earlier dialogue.
+- `adjusted_start_TCR` and `adjusted_end_TCR` show the actual placement and speech end.
+- TCR display rounds to the nearest frame (half-frame ties round up), including correct second/minute/hour rollover. Audio placement calculations remain in milliseconds, and the combined timeline preserves millisecond precision. Native Excel times that fall between frames are also rounded for TCR display only.
+- `TCR_OUT_OVERRUN` in `status` means the row's audio exceeded its original scripted duration. It need not delay any later line if there is enough silence available. A row delayed by the same character's earlier dialogue can still be `OK` if its own duration fits. Overlaps between different characters are allowed. `track` names the corresponding WAV.
 
 Validation runs before speech generation. Requests are sequential and are not automatically retried: retrying after a provider failure can incur additional charges for already generated rows. A failed run produces no completed ZIP and discards temporary audio. API voice availability is checked by ElevenLabs during generation. No live API calls are needed for tests.
 
@@ -54,6 +75,7 @@ Validation runs before speech generation. Requests are sequential and are not au
 ```sh
 v2/.venv/bin/python -m v2.main script.xlsx --validate-only
 v2/.venv/bin/python -m v2.main script.xlsx --output v2/runtime/session01.zip --fps 25
+v2/.venv/bin/python -m v2.main script.xlsx --output v2/runtime/faster.zip --speed 1.20
 v2/.venv/bin/python -m v2.main script.xlsx --sheet "English dialogue" --validate-only
 v2/.venv/bin/python -m unittest discover -s v2/tests -v
 ```

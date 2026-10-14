@@ -1,4 +1,5 @@
 Flask>=3.0,<4
+# System dependency: FFmpeg is required for speed settings above 1.00x.
 openpyxl>=3.1,<4
 pydub>=0.25,<0.26
 python-dotenv>=1.0,<2

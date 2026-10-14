@@ -11,6 +11,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 from openpyxl import Workbook
 
 from .excel_parser import SUPPORTED_FPS, TEMPLATE_HEADERS, parse_excel
+from .audio_speed import MAX_SPEED_RATE, check_speed_support
 from .exporter import safe_component
 from .pipeline import run_pipeline
 from .tts_client import ElevenLabsClient
@@ -29,7 +30,8 @@ def create_app(config=None):
 
     @app.get("/")
     def index():
-        return render_template("index.html", frame_rates=SUPPORTED_FPS)
+        return render_template("index.html", frame_rates=SUPPORTED_FPS,
+                               max_speed_rate=MAX_SPEED_RATE)
 
     @app.get("/template")
     def template():
@@ -60,8 +62,11 @@ def create_app(config=None):
             fps = int(request.form.get("fps", "25"))
             if fps not in SUPPORTED_FPS:
                 raise ValueError("Unsupported frame rate")
+            speed = check_speed_support(request.form.get("speed", "1.00"))
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 503
         output_name = request.form.get("output_name", "AD_v2_output").strip()
         if output_name.lower().endswith(".zip"):
             output_name = output_name[:-4].strip()
@@ -91,12 +96,12 @@ def create_app(config=None):
         jobs[job_id] = {"status": "running", "progress": [], "error": None,
                         "rows": len(rows), "tracks": len({row.group for row in rows}),
                         "percent": 0, "phase": "Generating audio",
-                        "download_name": download_name}
+                        "download_name": download_name, "speed": speed}
 
         def process():
             try:
                 summary = run_pipeline(upload_path, job_dir / "AD_v2_output.zip",
-                                       fps=fps, sheet_name=sheet_name, synthesize=synthesize,
+                                       fps=fps, sheet_name=sheet_name, speed=speed, synthesize=synthesize,
                                        progress=jobs[job_id]["progress"].append,
                                        progress_state=lambda state: jobs[job_id].update(state))
                 jobs[job_id].update(flagged_rows=summary["flagged_rows"], status="done",

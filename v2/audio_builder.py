@@ -1,4 +1,4 @@
-"""Render aligned tracks while retaining all speech, including overruns."""
+"""Render independently timed character tracks from a common episode origin."""
 
 import io
 from pydub import AudioSegment

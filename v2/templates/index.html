@@ -91,8 +91,15 @@
                         Find and preview voices in the
                         <a href="https://elevenlabs.io/voice-library" target="_blank" rel="noopener noreferrer">ElevenLabs Voice Library</a>.
                     </p>
-                    <p class="voice-preview-note">Download one WAV per episode and character, plus a timing report, in a ZIP.
-                        Tracks start at 00:00:00:00 with silence between lines. Speech beyond TCR OUT is preserved and flagged for review.</p>
+                    <p class="voice-preview-note">Download one WAV per episode and character, one combined timeline CSV per episode with all characters, and a timing report in a ZIP.
+                        A line starts at its scripted time or when that character's previous audio ends, whichever is later.
+                        Overruns use available silence; other characters keep their own timing. Tracks remain aligned from 00:00:00:00.</p>
+                </div>
+
+                <div class="output-field">
+                    <label class="field-label" for="speed-dial">Speed dial · <output id="speed-value" for="speed-dial">1.00x</output></label>
+                    <input type="range" id="speed-dial" name="speed" min="1.00" max="{{ '%.2f' | format(max_speed_rate) }}" step="0.01" value="1.00" aria-describedby="speed-help">
+                    <p class="field-help" id="speed-help">Speed up dialogue from 1.00x to {{ '%.2f' | format(max_speed_rate) }}x while preserving voice pitch. Audio placements and timeline CSVs use the adjusted clip lengths. Faster speech can reduce delays; dialogue never moves earlier than its original start.</p>
                 </div>
 
                 <button class="primary-button" id="submit-btn" type="submit" disabled>
