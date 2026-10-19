@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Review dubbed audio against the episode video, one episode at a time.">
+    <title>Dubbing Quality Check | Zibanka</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script type="module" src="{{ url_for('static', filename='app.js') }}"></script>
+</head>
+<body data-ffmpeg="{{ 'yes' if has_ffmpeg else 'no' }}">
+<header class="topbar">
+    <div class="topbar-inner">
+        <img class="logo" src="{{ url_for('static', filename='zibanka_logo.png') }}" alt="Zibanka">
+        <ol class="steps" aria-label="Progress">
+            <li class="step is-active" id="step-upload" aria-current="step"><span class="step-num">1</span>Upload</li>
+            <li class="step" id="step-dub"><span class="step-num">2</span>Dub</li>
+            <li class="step" id="step-review"><span class="step-num">3</span>Review</li>
+            <li class="step" id="step-export"><span class="step-num">4</span>Export</li>
+        </ol>
+    </div>
+</header>
+
+<!-- ============ Upload ============ -->
+<main class="upload-view" id="upload-view">
+    <div class="page-title">
+        <h1>Dubbing Quality Check</h1>
+        <p>Add one episode's script and video. The script is dubbed with ElevenLabs, then you review it against the picture.</p>
+    </div>
+
+    <form id="upload-form" class="panel" novalidate>
+        <div class="slots">
+            {% for slot in [
+                {'kind': 'script', 'title': 'Script', 'hint': 'Drop the Excel here, or', 'meta': '.xlsx, one episode, up to ' ~ max_script_mb ~ ' MB',
+                 'accept': '.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                 'icon': '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/>'},
+                {'kind': 'video', 'title': 'Video', 'hint': 'Drop the episode video here, or', 'meta': 'MP4 recommended, up to ' ~ max_video_mb ~ ' MB',
+                 'accept': '.mp4,.m4v,.webm,.mov,video/mp4,video/webm,video/quicktime',
+                 'icon': '<rect x="3" y="5" width="13" height="14" rx="2"/><path d="m16 10 5-3v10l-5-3"/>'},
+            ] %}
+            <div class="slot" id="{{ slot.kind }}-slot" data-state="empty">
+                <input class="visually-hidden" type="file" id="{{ slot.kind }}-input" accept="{{ slot.accept }}">
+                <label class="drop" for="{{ slot.kind }}-input">
+                    <svg class="drop-icon" viewBox="0 0 24 24" aria-hidden="true">{{ slot.icon | safe }}</svg>
+                    <span class="drop-title">{{ slot.title }}</span>
+                    <span class="drop-hint">{{ slot.hint }} <u>browse</u></span>
+                    <span class="drop-meta">{{ slot.meta }}</span>
+                </label>
+                <div class="filled" aria-live="polite">
+                    <div class="filled-head">
+                        <span class="status-dot" aria-hidden="true"></span>
+                        <div class="filled-name">
+                            <strong id="{{ slot.kind }}-name"></strong>
+                            <span id="{{ slot.kind }}-size"></span>
+                        </div>
+                        <button type="button" class="link-btn" data-replace="{{ slot.kind }}">Replace</button>
+                        <button type="button" class="icon-btn" data-clear="{{ slot.kind }}" aria-label="Remove {{ slot.title | lower }}">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+                        </button>
+                    </div>
+                    <div class="filled-body" id="{{ slot.kind }}-body"></div>
+                    <div class="slot-progress" aria-hidden="true"><div class="slot-progress-bar" id="{{ slot.kind }}-progress"></div></div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <!-- Where the script's lines fall against the video -->
+        <div class="fit" id="upload-fit" hidden>
+            <div class="fit-strip" id="upload-strip"></div>
+            <p class="fit-note" id="upload-fit-note"></p>
+        </div>
+
+        <div class="options">
+            <p class="options-summary">
+                <span id="settings-summary">25 fps, first worksheet</span>
+                <button type="button" class="link-btn" id="settings-toggle" aria-expanded="false" aria-controls="settings">Change</button>
+            </p>
+            <button type="button" class="link-btn" id="format-toggle" aria-expanded="false" aria-controls="format-help">What to upload</button>
+        </div>
+
+        <div class="settings" id="settings" hidden>
+            <label class="field">
+                <span>Timecode frame rate</span>
+                <select id="fps">
+                    {% for fps in frame_rates %}
+                    <option value="{{ fps }}"{% if fps == 25 %} selected{% endif %}>{{ fps }} fps</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label class="field">
+                <span>Speed dial <output id="speed-value" for="speed">1.00x</output></span>
+                <input id="speed" type="range" min="1.00" max="{{ '%.2f' | format(max_speed) }}" step="0.01" value="1.00">
+                <small>Speeds lines up with pitch preserved, as in AD version 2. Needs FFmpeg above 1.00x.</small>
+            </label>
+            <label class="field">
+                <span>Worksheet</span>
+                <input id="sheet-name" type="text" placeholder="First worksheet" autocomplete="off" spellcheck="false">
+            </label>
+        </div>
+
+        <div class="format-help" id="format-help" hidden>
+            <p><b>Script</b>: the same workbook format as AD version 2, for one episode. Headers in row 1:
+                EP NO, TCR IN, TCR OUT, CHARACTERS, VOICE ID and TARGET DIALOGUE.</p>
+            <p>Each line is sent to ElevenLabs with its VOICE ID and audio tags such as [laughing], exactly as AD version 2 does.</p>
+            <p><b>Video</b>: the episode picture, starting at 00:00:00:00 like the dubbed tracks.</p>
+        </div>
+
+        <p class="alert" id="form-error" role="alert" hidden></p>
+
+        <button class="primary" id="load-btn" type="submit" disabled>
+            <span class="primary-fill" id="load-fill"></span>
+            <span class="primary-label" id="load-label">Add the script and video to continue</span>
+        </button>
+    </form>
+</main>
+
+<!-- ============ Dubbing progress ============ -->
+<main class="dub-view" id="dub-view" hidden>
+    <div class="page-title">
+        <h1 id="dub-title">Dubbing episode</h1>
+        <p>The review opens by itself when the dub and the video are both ready. Keep this tab open.</p>
+    </div>
+    <section class="panel jobs" aria-live="polite">
+        <div class="job" id="job-dub" data-state="running">
+            <div class="job-head">
+                <span class="status-dot" aria-hidden="true"></span>
+                <h2>Dubbing with ElevenLabs</h2>
+                <span class="job-count" id="dub-count"></span>
+            </div>
+            <div class="job-track"><div class="job-bar" id="dub-bar"></div></div>
+            <p class="job-note" id="dub-note">Starting…</p>
+            <div class="job-actions" id="dub-actions" hidden>
+                <button class="secondary" id="dub-retry" type="button">Retry from this line</button>
+            </div>
+        </div>
+        <div class="job" id="job-video" data-state="running">
+            <div class="job-head">
+                <span class="status-dot" aria-hidden="true"></span>
+                <h2>Uploading the video</h2>
+                <span class="job-count" id="video-count"></span>
+            </div>
+            <div class="job-track"><div class="job-bar" id="video-bar"></div></div>
+            <p class="job-note" id="video-note">Starting…</p>
+            <div class="job-actions" id="video-actions" hidden>
+                <input class="visually-hidden" type="file" id="video-again" accept=".mp4,.m4v,.webm,.mov,video/mp4,video/webm,video/quicktime">
+                <button class="secondary" id="video-retry" type="button">Upload the video again</button>
+            </div>
+        </div>
+        <button class="link-btn cancel-btn" id="dub-cancel" type="button">Cancel and start over</button>
+    </section>
+</main>
+
+<!-- ============ Review ============ -->
+<main class="review-view" id="review-view" hidden>
+    <div class="review-head">
+        <div>
+            <h1 id="episode-title">Episode</h1>
+            <ul class="facts" id="episode-facts"></ul>
+        </div>
+        <div class="head-actions">
+            <button class="secondary" id="reset-btn" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.4-5.7M4 4v4h4"/></svg>
+                New episode
+            </button>
+            <button class="export-btn" id="export-btn" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 20h14"/></svg>
+                Export episode
+            </button>
+        </div>
+    </div>
+
+    <div class="workspace">
+        <section class="stage" aria-label="Video">
+            <div class="screen">
+                <video id="player" preload="auto" playsinline muted></video>
+                <div class="subs" id="subs" aria-live="off"></div>
+                <div class="screen-overlay" id="loading-overlay">
+                    <p id="loading-text">Loading audio…</p>
+                    <div class="loading-track"><div class="loading-bar" id="loading-bar"></div></div>
+                </div>
+            </div>
+        </section>
+
+        <aside class="side" aria-label="Script and session">
+            <div class="tabs" role="tablist">
+                <button class="tab" id="tab-script" role="tab" aria-selected="true" aria-controls="panel-script" type="button">Script</button>
+                <button class="tab" id="tab-info" role="tab" aria-selected="false" aria-controls="panel-info" type="button">Summary and help</button>
+            </div>
+            <div class="tab-panel script-panel" id="panel-script" role="tabpanel" aria-labelledby="tab-script"></div>
+            <div class="tab-panel" id="panel-info" role="tabpanel" aria-labelledby="tab-info" hidden>
+                <section class="side-block">
+                    <h2>Dub summary</h2>
+                    <ul class="notes" id="import-notes"></ul>
+                </section>
+                <section class="side-block">
+                    <h2>Reading the lanes</h2>
+                    <dl class="legend">
+                        <div><dt><span class="lg-slot"></span></dt><dd>Scripted slot, TCR IN to TCR OUT</dd></div>
+                        <div><dt><span class="lg-wave"></span></dt><dd>Dubbed audio where it plays</dd></div>
+                        <div><dt><span class="lg-over"></span></dt><dd>Audio running past TCR OUT</dd></div>
+                    </dl>
+                </section>
+                <p class="side-foot" id="file-meta"></p>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Transport -->
+    <div class="transport" id="transport" aria-label="Playback">
+        <div class="transport-left">
+            <button class="t-btn" id="frame-back" type="button" aria-label="Back one frame" title="Back one frame (←)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 6v12M13 6 5 12l8 6z"/></svg>
+            </button>
+            <button class="t-btn t-play" id="play-btn" type="button" aria-label="Play" title="Play (Space)">
+                <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5v14l12-7z"/></svg>
+                <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>
+            </button>
+            <button class="t-btn" id="frame-fwd" type="button" aria-label="Forward one frame" title="Forward one frame (→)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 6v12M11 6l8 6-8 6z"/></svg>
+            </button>
+            <div class="timecode" aria-live="off">
+                <span id="tc-now">00:00:00:00</span>
+                <span class="tc-total" id="tc-total">/ 00:00:00:00</span>
+            </div>
+        </div>
+        <div class="transport-right">
+            <span class="sync" id="sync-state" title="Dubbed audio is locked to the picture">Sync</span>
+            <button class="chip" id="subs-toggle" type="button" aria-pressed="true" title="Show the line being spoken on the picture (S)">Subtitles</button>
+            <label class="mix" title="The video file's own soundtrack">
+                <button class="chip" id="video-sound" type="button" aria-pressed="false">Video sound</button>
+                <input type="range" id="video-volume" min="0" max="1" step="0.01" value="0.4" aria-label="Video sound volume">
+            </label>
+            <label class="mix" title="Volume of all dubbed tracks">
+                <span class="mix-label">Dub sound</span>
+                <input type="range" id="master-volume" min="0" max="1.5" step="0.01" value="1" aria-label="Dub sound volume">
+            </label>
+            <label class="mix line-speed" id="line-speed-box" title="Select a line in the script to speed it up">
+                <span class="mix-label" id="line-speed-label">Line speed</span>
+                <input type="range" id="line-speed" min="1.00" max="{{ '%.2f' | format(max_speed) }}" step="0.01" value="1.00" disabled aria-describedby="line-speed-value">
+                <output id="line-speed-value" for="line-speed">Select a line</output>
+            </label>
+        </div>
+    </div>
+
+    <!-- Lanes: one per character, on a shared time axis -->
+    <section class="lanes" id="lanes" aria-label="Character tracks"></section>
+</main>
+
+<dialog class="dialog" id="export-dialog" aria-labelledby="export-title">
+    <h2 id="export-title">Export episode</h2>
+    <p class="dialog-lead">Download the episode as reviewed, in the same layout as AD version 2.</p>
+    <ul class="export-list" id="export-list"></ul>
+    <p class="dialog-note">The review stays open, so you can keep working and export again later.</p>
+    <div class="dialog-actions">
+        <a class="export-btn" id="export-download" href="#">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11m0 0 4-4m-4 4-4-4M5 20h14"/></svg>
+            Download ZIP
+        </a>
+        <button class="secondary" id="export-close" type="button">Close</button>
+    </div>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

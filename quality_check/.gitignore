@@ -1,0 +1,6 @@
+.env
+.venv/
+runtime/
+*.zip
+*.partial
+.DS_Store
