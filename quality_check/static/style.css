@@ -466,6 +466,9 @@ kbd {
 .line-speed.is-active .mix-label, .line-speed.is-active output { color: var(--ink); }
 .line-speed.is-busy { opacity: 0.6; cursor: progress; }
 .line-speed input:disabled { opacity: 0.45; cursor: default; }
+.suggested { padding-left: 10px; border-left: 1px solid var(--line); color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.suggested b { color: var(--ink); font-weight: 600; }
+.suggested.is-over b { color: #b2470b; }
 
 /* ---------- Lanes ---------- */
 .swatch { width: 10px; height: 10px; border-radius: 3px; }

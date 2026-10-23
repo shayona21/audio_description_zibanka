@@ -301,6 +301,9 @@ class DubbingTests(unittest.TestCase):
         self.assertEqual(self.track_bytes(sid, 0), kuhu_before)
         lines = {l["row"]: l for l in body["audio"]["lines"]}
         self.assertEqual(lines[3]["line_speed"], 1.2)
+        # The suggested speed is computed from the take, which a line speed must not change.
+        self.assertEqual(lines[3]["take_ms"], before[3]["take_ms"])
+        self.assertEqual(before[3]["take_ms"], before[3]["audio_end_ms"] - before[3]["audio_start_ms"])
         self.assertEqual(lines[3]["audio_start_ms"], before[3]["audio_start_ms"])      # same start
         natural = before[3]["audio_end_ms"] - before[3]["audio_start_ms"]
         self.assertAlmostEqual(lines[3]["audio_end_ms"] - lines[3]["audio_start_ms"], natural / 1.2, delta=30)

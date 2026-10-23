@@ -87,6 +87,11 @@ request is made. Speed is always applied to the line's take as dubbed (`clips/<r
 changes never stack and 1.00x restores the take exactly. Sped-up lines show a badge such as `1.08x`.
 Regenerating a line gives a new take at 1.00x.
 
+Beside the slider, **Suggested speed** shows, for the selected line only, the speed at which its take
+would fit between TCR IN and TCR OUT: take length divided by slot length, rounded up to 0.01x, and
+1.00x when the line already fits. Above 1.20x it is shown in amber. It is a calculation only and never
+changes the audio; the reviewer decides whether to use the slider.
+
 ## Export (Block 6)
 
 **Export episode** (top right of the review) downloads `Episode_<ep>_QC.zip`, in AD version 2's layout:

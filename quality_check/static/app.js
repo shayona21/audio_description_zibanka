@@ -757,9 +757,35 @@ function selectedLine() {
     return state.session.audio.lines.find(l => l.row === state.panel.selected) || null;
 }
 
+/**
+ * Suggested speed for a line: the dubbed take's length divided by its slot (TCR OUT - TCR IN),
+ * rounded up to 0.01x so that speed would make it fit; 1.00x when it already fits. A calculation
+ * only: it never changes the audio. The take is the line at 1.00x, so moving the slider does not
+ * change the suggestion.
+ */
+function suggestedSpeed(line) {
+    const slot = line.end_ms - line.start_ms;
+    const take = line.take_ms ?? (line.audio_end_ms - line.audio_start_ms) * (line.line_speed || 1);
+    return Math.max(1, Math.ceil(take / slot * 100 - 1e-6) / 100);
+}
+
+function showSuggestion(line) {
+    const box = $('line-speed-suggested');
+    if (!line) { box.hidden = true; return; }
+    const speed = suggestedSpeed(line);
+    const limit = Number($('line-speed').max);
+    box.hidden = false;
+    box.classList.toggle('is-over', speed > limit);
+    box.replaceChildren('Suggested speed: ', el('b', {}, `${speed.toFixed(2)}x`));
+    box.title = speed > limit
+        ? `Row ${line.row} would need ${speed.toFixed(2)}x to fit between TCR IN and TCR OUT, above the ${limit.toFixed(2)}x limit.`
+        : `Row ${line.row} fits between TCR IN and TCR OUT at ${speed.toFixed(2)}x. This is a suggestion only.`;
+}
+
 /** Point the slider at the selected line (or disable it when none is selected). */
 function updateSpeedControl() {
     const line = selectedLine();
+    showSuggestion(line);
     const box = $('line-speed-box');
     const slider = $('line-speed');
     box.classList.toggle('is-active', Boolean(line));

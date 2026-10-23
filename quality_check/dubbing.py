@@ -136,6 +136,8 @@ def assemble(folder, rows, summary, fps, speed, lengths, rebuild=None):
     temp.write_text(json.dumps({"per_second": PEAKS_PER_SECOND, "tracks": peaks}), encoding="utf-8")
     temp.replace(peaks_file)
 
+    take_lengths = {row.row_number: len(read_clip(take_path(folder, row.row_number).read_bytes()))
+                    for row in rows if take_path(folder, row.row_number).is_file()}
     lines = []
     for p in sorted(placed, key=lambda p: (p.start_ms, p.row.row_number)):
         row = p.row
@@ -152,6 +154,8 @@ def assemble(folder, rows, summary, fps, speed, lengths, rebuild=None):
             "audio_end_ms": p.end_ms,
             "delay_ms": p.delay_ms,
             "overrun_ms": max(0, (p.end_ms - p.start_ms) - (row.end_ms - row.start_ms)),
+            # Length of the take as dubbed (line speed 1.00x): the basis for the suggested speed.
+            "take_ms": take_lengths.get(row.row_number, p.end_ms - p.start_ms),
         })
 
     over = sum(1 for line in lines if line["overrun_ms"])
