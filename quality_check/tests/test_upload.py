@@ -1,6 +1,7 @@
 """Run from the repository root: python -m unittest discover -s quality_check/tests -t . -v"""
 
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -12,11 +13,19 @@ import wave
 import zipfile
 
 from quality_check.app import create_app
-from quality_check.tests.helpers import ONE_EPISODE, dub_zip, fake_voice, have_pydub, workbook_bytes
+from quality_check.tests.helpers import (ONE_EPISODE, SECOND_EPISODE, dub_zip, fake_voice, have_pydub,
+                                         workbook_bytes)
+from v2.audio_speed import fit_speed
 
 
-def make_client(runtime, synthesize=fake_voice):
-    return create_app({"RUNTIME_DIR": runtime, "TESTING": True, "SYNTHESIZE": synthesize}).test_client()
+def make_client(runtime, synthesize=fake_voice, v2_runtime=None):
+    return create_app({"RUNTIME_DIR": runtime, "TESTING": True, "SYNTHESIZE": synthesize,
+                       "V2_RUNTIME_DIR": v2_runtime or Path(runtime).parent / "v2_runtime"}).test_client()
+
+
+def natural_ms(text):
+    """Length of the fake voice's take for ``text`` (its whole clip is speech)."""
+    return max(300, 45 * len(text))
 
 
 class ScriptCheckTests(unittest.TestCase):
@@ -110,7 +119,7 @@ class DubbingTests(unittest.TestCase):
         expected = {}
         with zipfile.ZipFile(io.BytesIO(dub_zip(self.tmp.name, ONE_EPISODE))) as archive:
             for name in ("KUHU", "AMRITA"):
-                with wave.open(io.BytesIO(archive.read(f"Episode_1_{name}.wav"))) as wav:
+                with wave.open(io.BytesIO(archive.read(f"tracks/Episode_1_{name}.wav"))) as wav:
                     expected[name] = wav.readframes(wav.getnframes())
         folder = self.runtime / sid
         for track in record["audio"]["tracks"]:
@@ -186,14 +195,32 @@ class DubbingTests(unittest.TestCase):
         self.assertLessEqual(len(self.calls), 2)     # stopped before the next request
         self.assertEqual(client.get(f"/session/{sid}").status_code, 404)
 
-    def test_speed_dial_shortens_every_clip(self):
+    def test_every_line_is_fitted_to_its_slot(self):
+        # Pass 2 as in AD version 2: the take is ElevenLabs as delivered, what plays is fitted.
         client = make_client(self.runtime, self.voice)
-        sid = self.start(client, speed="1.20").get_json()["session_id"]
+        sid = self.start(client).get_json()["session_id"]
         record = self.wait(client, sid)
-        self.assertEqual(record["speed"], 1.2)
-        for line in record["audio"]["lines"]:
-            natural = max(300, 45 * len(line["text"]))
-            self.assertAlmostEqual(line["audio_end_ms"] - line["audio_start_ms"], natural / 1.2, delta=30)
+        self.assertNotIn("speed", record)                                   # no speed dial any more
+        folder = self.runtime / sid
+        lines = {line["row"]: line for line in record["audio"]["lines"]}
+        self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
+                         {2: 0.7, 3: 0.7, 4: 1.5, 5: 0.7, 6: 0.81})
+        self.assertEqual(lines[4]["needed_speed"], 2.16)                    # held at the 1.5x limit
+        for row, line in lines.items():
+            take = (folder / "clips" / f"{row}.take.wav").read_bytes()
+            self.assertEqual(fit_speed(take, line["end_ms"] - line["start_ms"]), line["fit_speed"])
+            self.assertEqual(line["line_speed"], line["fit_speed"])
+            self.assertFalse(line["speed_set"])
+            self.assertAlmostEqual(line["audio_end_ms"] - line["audio_start_ms"],
+                                   natural_ms(line["text"]) / line["fit_speed"], delta=30)
+
+    def test_generating_needs_ffmpeg(self):
+        client = make_client(self.runtime, self.voice)
+        with patch("v2.audio_speed.shutil.which", return_value=None):
+            response = self.start(client)
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("FFmpeg", response.get_json()["error"])
+        self.assertEqual(self.calls, [])
 
     # -- Block 5: regenerate one line ---------------------------------------------------------
     def dubbed(self, voice=None):
@@ -216,14 +243,15 @@ class DubbingTests(unittest.TestCase):
         lines = {l["row"]: l for l in record["audio"]["lines"]}
         self.assertGreater(lines[6]["delay_ms"], 0)
         self.calls.clear()
-        response = self.regenerate(client, sid, 3, "[Angry] Get out!")
+        response = self.regenerate(client, sid, 3, "Out!")
         self.assertEqual(response.status_code, 200, response.get_json())
         body = response.get_json()
-        self.assertEqual(self.calls, ["[Angry] Get out!"])            # exactly one ElevenLabs request
+        self.assertEqual(self.calls, ["Out!"])                        # exactly one ElevenLabs request
         self.assertEqual(body["changed_tracks"], [1])                 # AMRITA only
         self.assertEqual(self.track_bytes(sid, 0), kuhu_before)       # KUHU's file untouched
         new = {l["row"]: l for l in body["audio"]["lines"]}
-        self.assertEqual(new[3]["audio_end_ms"] - new[3]["audio_start_ms"], max(300, 45 * len("[Angry] Get out!")))
+        self.assertEqual(new[3]["fit_speed"], 0.7)                    # the new take is fitted too
+        self.assertAlmostEqual(new[3]["audio_end_ms"] - new[3]["audio_start_ms"], natural_ms("Out!") / 0.7, delta=30)
         self.assertTrue(new[3]["edited"])
         self.assertEqual(new[3]["original"], lines[3]["text"])
         # Row 6 no longer waits for row 3's overrun: it moves back to its own TCR IN.
@@ -237,9 +265,12 @@ class DubbingTests(unittest.TestCase):
             self.assertEqual(track.readframes(500), clip.readframes(500))
 
     def test_change_to_episode_end_rebuilds_every_track(self):
-        # KUHU's row 5 is the last audio in the episode; shortening row 4 pulls it earlier, so the
-        # episode gets shorter and (V2 rule: one length for all tracks) every track is rebuilt.
-        client, sid, record = self.dubbed()
+        # A long take for KUHU's row 5 makes it the last audio in the episode (past 32 s); shortening
+        # row 4 then pulls it earlier, so the episode gets shorter and (V2 rule: one length for all
+        # tracks) every track is rebuilt.
+        client, sid, _record = self.dubbed()
+        record = self.regenerate(client, sid, 5, "Stop! " * 10).get_json()
+        self.assertGreater(record["audio"]["duration_ms"], 32000)
         body = self.regenerate(client, sid, 4, "[Gasps] Too long.").get_json()
         self.assertEqual(sorted(body["changed_tracks"]), [0, 1])
         self.assertLess(body["audio"]["duration_ms"], record["audio"]["duration_ms"])
@@ -255,7 +286,7 @@ class DubbingTests(unittest.TestCase):
 
     def test_line_past_the_episode_end_rebuilds_all_tracks_to_one_length(self):
         client, sid, record = self.dubbed()
-        body = self.regenerate(client, sid, 6, "Stop! " * 40).get_json()  # KUHU's last line, much longer
+        body = self.regenerate(client, sid, 6, "Stop! " * 60).get_json()  # past the last TCR OUT even at 1.5x
         self.assertEqual(sorted(body["changed_tracks"]), [0, 1])
         self.assertGreater(body["audio"]["duration_ms"], record["audio"]["duration_ms"])
         lengths = {len(self.track_bytes(sid, i)) for i in (0, 1)}
@@ -291,8 +322,11 @@ class DubbingTests(unittest.TestCase):
         client, sid, record = self.dubbed()
         folder = self.runtime / sid
         take = (folder / "clips" / "3.take.wav").read_bytes()
+        fitted = (folder / "clips" / "3.wav").read_bytes()
         kuhu_before = self.track_bytes(sid, 0)
         before = {l["row"]: l for l in record["audio"]["lines"]}
+        self.assertEqual(before[3]["fit_speed"], 0.7)
+        natural = natural_ms(before[3]["text"])
         self.calls.clear()
 
         body = self.speed(client, sid, 3, 1.2).get_json()
@@ -300,22 +334,22 @@ class DubbingTests(unittest.TestCase):
         self.assertEqual(body["changed_tracks"], [1])                 # AMRITA only
         self.assertEqual(self.track_bytes(sid, 0), kuhu_before)
         lines = {l["row"]: l for l in body["audio"]["lines"]}
-        self.assertEqual(lines[3]["line_speed"], 1.2)
-        # The suggested speed is computed from the take, which a line speed must not change.
-        self.assertEqual(lines[3]["take_ms"], before[3]["take_ms"])
-        self.assertEqual(before[3]["take_ms"], before[3]["audio_end_ms"] - before[3]["audio_start_ms"])
+        self.assertEqual((lines[3]["line_speed"], lines[3]["speed_set"]), (1.2, True))
+        self.assertEqual(lines[3]["fit_speed"], 0.7)                  # the suggestion stays pass 2's
         self.assertEqual(lines[3]["audio_start_ms"], before[3]["audio_start_ms"])      # same start
-        natural = before[3]["audio_end_ms"] - before[3]["audio_start_ms"]
         self.assertAlmostEqual(lines[3]["audio_end_ms"] - lines[3]["audio_start_ms"], natural / 1.2, delta=30)
         self.assertLess(lines[6]["audio_start_ms"], before[6]["audio_start_ms"])       # row 6 waits less
         self.assertEqual([m["row"] for m in body["moved"]], [6])
 
-        # Changes never stack: 1.10x is measured from the take, and 1.00x restores it byte for byte.
+        # Changes never stack: speeds are measured from the take; 1.00x is the take byte for byte
+        # and the fit speed gives the fitted clip back (no longer a reviewer change).
         body = self.speed(client, sid, 3, 1.1).get_json()
         line = next(l for l in body["audio"]["lines"] if l["row"] == 3)
         self.assertAlmostEqual(line["audio_end_ms"] - line["audio_start_ms"], natural / 1.1, delta=30)
-        body = self.speed(client, sid, 3, 1.0).get_json()
+        self.speed(client, sid, 3, 1.0)
         self.assertEqual((folder / "clips" / "3.wav").read_bytes(), take)
+        body = self.speed(client, sid, 3, 0.7).get_json()
+        self.assertEqual((folder / "clips" / "3.wav").read_bytes(), fitted)
         self.assertEqual(client.get(f"/session/{sid}").get_json()["line_speeds"], {})
         self.assertEqual({l["row"]: l["audio_start_ms"] for l in body["audio"]["lines"]},
                          {r: l["audio_start_ms"] for r, l in before.items()})
@@ -324,13 +358,16 @@ class DubbingTests(unittest.TestCase):
         client, sid, _record = self.dubbed()
         self.speed(client, sid, 3, 1.15)
         body = self.regenerate(client, sid, 3, "[Angry] Get out!").get_json()
-        self.assertEqual(next(l for l in body["audio"]["lines"] if l["row"] == 3)["line_speed"], 1.0)
+        line = next(l for l in body["audio"]["lines"] if l["row"] == 3)
+        self.assertEqual((line["line_speed"], line["speed_set"]), (line["fit_speed"], False))
         self.assertEqual(client.get(f"/session/{sid}").get_json()["line_speeds"], {})
 
     def test_line_speed_validation(self):
         client, sid, _record = self.dubbed()
-        self.assertEqual(self.speed(client, sid, 3, 1.5).status_code, 400)
-        self.assertEqual(self.speed(client, sid, 3, 0.9).status_code, 400)
+        self.assertEqual(self.speed(client, sid, 3, 1.5).status_code, 200)    # the limits are allowed
+        self.assertEqual(self.speed(client, sid, 3, 0.7).status_code, 200)
+        self.assertEqual(self.speed(client, sid, 3, 1.51).status_code, 400)
+        self.assertEqual(self.speed(client, sid, 3, 0.69).status_code, 400)
         self.assertEqual(self.speed(client, sid, 3, "fast").status_code, 400)
         self.assertEqual(self.speed(client, sid, 99, 1.1).status_code, 404)
 
@@ -357,13 +394,17 @@ class DubbingTests(unittest.TestCase):
         # V2's report columns, with the reviewed timings.
         report = archive.read("processing_report.csv").decode("utf-8-sig").splitlines()
         self.assertTrue(report[0].startswith("excel_row,episode,character,voice_id,start_TCR"))
+        self.assertTrue(report[0].endswith(",fit_speed"))
         self.assertEqual(len(report), 6)
+        self.assertTrue(report[1].endswith(",0.70"))      # row 2: pass 2's fit
+        self.assertTrue(report[5].endswith(",1.10"))      # row 6: the reviewer's speed
         # The Excel: edited text in TARGET DIALOGUE, highlighted with a note; other rows untouched.
         with archive.open("script_QC.xlsx") as handle:
             sheet = load_workbook(io.BytesIO(handle.read())).active
         self.assertEqual(sheet.cell(row=3, column=7).value, "[Angry] Get out!")
         self.assertIn("Script wording: [Angry] You beggar", sheet.cell(row=3, column=7).comment.text)
         self.assertIn("1.10x", sheet.cell(row=6, column=7).comment.text)
+        self.assertIn("fitted speed was 0.81x", sheet.cell(row=6, column=7).comment.text)
         self.assertEqual(sheet.cell(row=2, column=7).value, ONE_EPISODE[0][6])
         self.assertIsNone(sheet.cell(row=2, column=7).comment)
         changes = archive.read("qc_changes.csv").decode("utf-8-sig").splitlines()
@@ -389,7 +430,6 @@ class DubbingTests(unittest.TestCase):
 
     def test_bad_inputs(self):
         client = make_client(self.runtime, self.voice)
-        self.assertEqual(self.start(client, speed="2").status_code, 400)
         sid = self.start(client).get_json()["session_id"]
         data = {"video": (io.BytesIO(b"x"), "episode.avi")}
         self.assertEqual(client.post(f"/session/{sid}/video", data=data,
@@ -398,6 +438,147 @@ class DubbingTests(unittest.TestCase):
         self.assertEqual(client.get("/session/../etc/video").status_code, 404)
         self.assertEqual(client.get(f"/session/{sid}/tracks/9.wav").status_code, 404)
         self.wait(client, sid)
+
+
+@unittest.skipUnless(have_pydub(), "AD version 2 runs are built with pydub (Python 3.11/3.12)")
+class ImportTests(unittest.TestCase):
+    """Reviewing an AD version 2 run: its fitted line clips are the takes; nothing is dubbed again."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = Path(self.tmp.name) / "runtime"
+        self.v2_runtime = Path(self.tmp.name) / "v2_runtime"
+        self.calls = []
+        self.client = make_client(self.runtime, self.voice, self.v2_runtime)
+
+    def voice(self, text, voice_id):
+        self.calls.append(text)
+        return fake_voice(text, voice_id)
+
+    def server_run(self, rows=ONE_EPISODE + SECOND_EPISODE, status="done", fps=25, finished=100.0):
+        """A finished V2 job folder, as AD version 2 leaves it on the server."""
+        run_id = os.urandom(16).hex()
+        folder = self.v2_runtime / run_id
+        folder.mkdir(parents=True)
+        (folder / "AD_v2_output.zip").write_bytes(dub_zip(self.tmp.name, rows, name=f"{run_id}.zip", fps=fps))
+        (folder / "run.json").write_text(json.dumps({
+            "download_name": "Show_S1.zip", "created": finished - 10, "finished": finished, "fps": fps,
+            "sheet": None, "rows": len(rows), "status": status, "episodes": sorted({r[0] for r in rows})}))
+        return run_id
+
+    def start(self, run_id, episode="1", **form):
+        data = {"source": "v2", "run": run_id, "episode": episode, "fps": "25", **form}
+        return self.client.post("/sessions", data=data, content_type="multipart/form-data")
+
+    def wait(self, sid, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            record = self.client.get(f"/session/{sid}").get_json()
+            if record["status"] != "dubbing":
+                return record
+            time.sleep(0.05)
+        self.fail("import did not finish")
+
+    def test_lists_finished_runs_newest_first(self):
+        older = self.server_run(rows=ONE_EPISODE, finished=100.0)
+        newer = self.server_run(finished=200.0)
+        self.server_run(rows=ONE_EPISODE, status="running")             # not finished: not listed
+        (self.v2_runtime / "not-a-run").mkdir()
+        runs = self.client.get("/v2-runs").get_json()["runs"]
+        self.assertEqual([r["id"] for r in runs], [newer, older])
+        self.assertEqual(runs[0]["episodes"], ["1", "2"])
+        details = self.client.get(f"/v2-runs/{newer}").get_json()
+        self.assertEqual([e["episode"] for e in details["episodes"]], ["1", "2"])
+        self.assertEqual(details["episodes"][0]["lines"], 5)
+        self.assertEqual(details["fps"], 25)
+
+    def test_episode_from_a_server_run_matches_ad_version_2_exactly(self):
+        run_id = self.server_run()
+        response = self.start(run_id)
+        self.assertEqual(response.status_code, 201, response.get_json())
+        record = self.wait(response.get_json()["session_id"])
+        self.assertEqual(record["status"], "dubbed", record.get("error"))
+        self.assertEqual(self.calls, [])                                   # no ElevenLabs request
+        self.assertEqual((record["source"], record["episode"], record["summary"]["lines"]), ("v2", "1", 5))
+        folder = self.runtime / record["session_id"]
+        with zipfile.ZipFile(self.v2_runtime / run_id / "AD_v2_output.zip") as archive:
+            # The tracks rebuilt from the line clips are V2's tracks, sample for sample.
+            for track in record["audio"]["tracks"]:
+                with wave.open(io.BytesIO(archive.read(f"tracks/Episode_1_{track['character']}.wav"))) as wav:
+                    expected = wav.readframes(wav.getnframes())
+                with wave.open(str(folder / "tracks" / f"{track['index']}.wav")) as wav:
+                    self.assertEqual(wav.readframes(wav.getnframes()), expected, track["character"])
+            self.assertEqual((folder / "clips" / "4.wav").read_bytes(), archive.read("lines/1_KUHU_4.wav"))
+        lines = {line["row"]: line for line in record["audio"]["lines"]}
+        self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
+                         {2: 0.7, 3: 0.7, 4: 1.5, 5: 0.7, 6: 0.81})     # from V2's report
+        self.assertAlmostEqual(lines[4]["needed_speed"], 2.16, delta=0.02)
+
+    def test_imported_line_speed_is_measured_from_the_natural_take(self):
+        record = self.wait(self.start(self.server_run()).get_json()["session_id"])
+        sid = record["session_id"]
+        folder = self.runtime / sid
+        fitted = (folder / "clips" / "4.wav").read_bytes()
+        natural = natural_ms(next(l["text"] for l in record["audio"]["lines"] if l["row"] == 4))
+        body = self.client.post(f"/session/{sid}/lines/4/speed", json={"speed": 1.0}).get_json()
+        line = next(l for l in body["audio"]["lines"] if l["row"] == 4)
+        self.assertAlmostEqual(line["audio_end_ms"] - line["audio_start_ms"], natural, delta=40)
+        self.client.post(f"/session/{sid}/lines/4/speed", json={"speed": 1.5})
+        self.assertEqual((folder / "clips" / "4.wav").read_bytes(), fitted)  # back to V2's clip exactly
+
+    def test_regenerating_an_imported_line_uses_elevenlabs_once(self):
+        record = self.wait(self.start(self.server_run()).get_json()["session_id"])
+        sid = record["session_id"]
+        body = self.client.post(f"/session/{sid}/lines/3", json={"text": "Out!"}).get_json()
+        self.assertEqual(self.calls, ["Out!"])
+        line = next(l for l in body["audio"]["lines"] if l["row"] == 3)
+        self.assertEqual((line["fit_speed"], line["edited"]), (0.7, True))
+        archive = zipfile.ZipFile(io.BytesIO(self.client.get(f"/session/{sid}/export").data))
+        self.assertIn("Episode_1_KUHU.wav", archive.namelist())
+
+    def test_uploaded_zip_finds_the_frame_rate_the_run_used(self):
+        data = dub_zip(self.tmp.name, ONE_EPISODE + SECOND_EPISODE, name="thirty.zip", fps=30)
+        form = {"dub": (io.BytesIO(data), "Show_S1.zip"), "fps": "25"}
+        response = self.client.post("/v2-runs", data=form, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 201, response.get_json())
+        details = response.get_json()
+        self.assertEqual((details["fps"], details["name"]), (30, "Show_S1.zip"))
+        self.assertTrue(details["id"].startswith("up-"))
+        response = self.start(details["id"], episode="2")
+        self.assertEqual(response.status_code, 201, response.get_json())
+        record = self.wait(response.get_json()["session_id"])
+        self.assertEqual((record["status"], record["fps"], record["summary"]["lines"]), ("dubbed", 30, 2))
+        self.assertEqual([t["character"] for t in record["audio"]["tracks"]], ["KUHU", "RAVI"])
+
+    def test_bad_runs_are_refused_with_a_reason(self):
+        upload = lambda data, name="run.zip": self.client.post(
+            "/v2-runs", data={"dub": (io.BytesIO(data), name), "fps": "25"}, content_type="multipart/form-data")
+        self.assertIn("not a ZIP", upload(b"not a zip").get_json()["error"])
+        self.assertEqual(upload(b"x", "run.xlsx").status_code, 400)
+        old = io.BytesIO()
+        with zipfile.ZipFile(old, "w") as archive:          # an older V2 ZIP: tracks only
+            archive.writestr("Episode_1_KUHU.wav", b"RIFF")
+        response = upload(old.getvalue())
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no line clips", response.get_json()["error"])
+        self.assertFalse(any((self.runtime / "uploads").iterdir()))      # refused uploads are not kept
+
+        run_id = self.server_run(rows=ONE_EPISODE)
+        self.assertEqual(self.start(run_id, episode="7").status_code, 400)
+        self.assertEqual(self.start("0" * 32).status_code, 404)
+        self.assertEqual(self.client.get("/v2-runs/../../etc").status_code, 404)
+        # A clip missing from the ZIP is reported by row before anything is stored.
+        path = self.v2_runtime / run_id / "AD_v2_output.zip"
+        with zipfile.ZipFile(path) as archive:
+            items = {name: archive.read(name) for name in archive.namelist() if name != "lines/1_AMRITA_3.wav"}
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, data in items.items():
+                archive.writestr(name, data)
+        response = self.start(run_id)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Excel row 3", response.get_json()["error"])
+        self.assertFalse(any(p.name != "uploads" for p in self.runtime.iterdir()))
 
 
 if __name__ == "__main__":

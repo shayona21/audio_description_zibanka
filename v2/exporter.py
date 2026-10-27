@@ -8,6 +8,17 @@ def safe_component(value):
     return value[:70].rstrip(" .") or "unnamed"
 
 
+# ZIP layout. Quality Check reads these names when it imports a run, so keep both tools in step.
+TRACKS_DIR = "tracks"          # one full-length timeline WAV per <character, episode>
+LINES_DIR = "lines"            # one WAV per dubbed row
+SCRIPT_NAME = "script.xlsx"    # copy of the input workbook
+
+
+def line_name(row):
+    """``<episode>_<character>_<Excel row>.wav``; the row number makes every name unique."""
+    return f"{safe_component(row.episode)}_{safe_component(row.character)}_{row.row_number}.wav"
+
+
 def track_names(groups):
     names, used = {}, set()
     for episode, character in sorted(groups):
@@ -23,7 +34,7 @@ def track_names(groups):
 
 REPORT_FIELDS = ("excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR",
                  "duration", "actual_duration_ms", "overrun_amnt_ms", "status", "track",
-                 "adjusted_start_TCR", "adjusted_end_TCR")
+                 "adjusted_start_TCR", "adjusted_end_TCR", "fit_speed")
 
 TIMELINE_FIELDS = ("Dialogue", "Original time start", "Original time end",
                    "Adjusted time start", "Adjusted time end", "Delay")
@@ -93,12 +104,14 @@ def write_csv(path, records, fields):
             writer.writerow(safe)
 
 
-def export_archive(output_path, files):
+def export_archive(output_path, files, root=None):
+    """Write ``files`` to a ZIP atomically. With ``root``, folders below it are kept in the ZIP
+    (``root/tracks/x.wav`` -> ``tracks/x.wav``); without it every file sits at the top level."""
     temporary = output_path.with_suffix(".zip.partial")
     try:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in files:
-                archive.write(path, arcname=path.name)
+                archive.write(path, arcname=path.relative_to(root).as_posix() if root else path.name)
         temporary.replace(output_path)
     finally:
         temporary.unlink(missing_ok=True)

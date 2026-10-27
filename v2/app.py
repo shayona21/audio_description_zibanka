@@ -1,9 +1,11 @@
 """Independent local Flask app. Run from the repository: python -m v2.app."""
 
 import io
+import json
 import os
 from pathlib import Path
 import threading
+import time
 import uuid
 
 from dotenv import load_dotenv
@@ -11,10 +13,19 @@ from flask import Flask, jsonify, render_template, request, send_file
 from openpyxl import Workbook
 
 from .excel_parser import SUPPORTED_FPS, TEMPLATE_HEADERS, parse_excel
-from .audio_speed import MAX_SPEED_RATE, check_speed_support
+from .audio_speed import check_ffmpeg
 from .exporter import safe_component
 from .pipeline import run_pipeline
 from .tts_client import ElevenLabsClient
+
+
+RUN_RECORD = "run.json"
+
+
+def write_run_record(job_dir, record):
+    temp = job_dir / (RUN_RECORD + ".partial")
+    temp.write_text(json.dumps(record, indent=1), encoding="utf-8")
+    temp.replace(job_dir / RUN_RECORD)
 
 
 def create_app(config=None):
@@ -30,8 +41,7 @@ def create_app(config=None):
 
     @app.get("/")
     def index():
-        return render_template("index.html", frame_rates=SUPPORTED_FPS,
-                               max_speed_rate=MAX_SPEED_RATE)
+        return render_template("index.html", frame_rates=SUPPORTED_FPS)
 
     @app.get("/template")
     def template():
@@ -62,7 +72,7 @@ def create_app(config=None):
             fps = int(request.form.get("fps", "25"))
             if fps not in SUPPORTED_FPS:
                 raise ValueError("Unsupported frame rate")
-            speed = check_speed_support(request.form.get("speed", "1.00"))
+            check_ffmpeg()  # pass 2 fits every line to its slot with FFmpeg
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
         except RuntimeError as exc:
@@ -96,18 +106,25 @@ def create_app(config=None):
         jobs[job_id] = {"status": "running", "progress": [], "error": None,
                         "rows": len(rows), "tracks": len({row.group for row in rows}),
                         "percent": 0, "phase": "Generating audio",
-                        "download_name": download_name, "speed": speed}
+                        "download_name": download_name}
+        # Run details on disk, so the Dubbing Quality Check can list and import finished runs.
+        record = {"download_name": download_name, "created": time.time(), "fps": fps,
+                  "sheet": sheet_name, "rows": len(rows), "status": "running"}
+        write_run_record(job_dir, record)
 
         def process():
             try:
                 summary = run_pipeline(upload_path, job_dir / "AD_v2_output.zip",
-                                       fps=fps, sheet_name=sheet_name, speed=speed, synthesize=synthesize,
+                                       fps=fps, sheet_name=sheet_name, synthesize=synthesize,
                                        progress=jobs[job_id]["progress"].append,
                                        progress_state=lambda state: jobs[job_id].update(state))
-                jobs[job_id].update(flagged_rows=summary["flagged_rows"], status="done",
-                                    percent=100, phase="Complete")
+                jobs[job_id].update(flagged_rows=summary["flagged_rows"], fitted_rows=summary["fitted_rows"],
+                                    status="done", percent=100, phase="Complete")
+                write_run_record(job_dir, dict(record, status="done", finished=time.time(),
+                                               episodes=sorted({row.episode for row in rows})))
             except Exception as exc:
                 jobs[job_id].update(error=str(exc), status="error")
+                write_run_record(job_dir, dict(record, status="error", error=str(exc)))
 
         threading.Thread(target=process, daemon=True).start()
         return jsonify(job_id=job_id, download_name=download_name), 202

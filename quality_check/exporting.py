@@ -3,10 +3,11 @@
 The ZIP holds:
   Episode_<ep>_<character>.wav   one per character, as reviewed (edits and line speeds included)
   Episode_<ep>_timeline.csv      V2's combined timeline, recomputed for the reviewed audio
-  processing_report.csv          V2's report, same columns, for the reviewed audio
+  processing_report.csv          V2's report, same columns, for the reviewed audio (fit_speed is the
+                                 speed each line plays at: pass 2's fit or the reviewer's choice)
   <script>_QC.xlsx               the uploaded workbook with edited lines written into TARGET DIALOGUE;
                                  changed cells are highlighted and carry a note with the script wording
-  qc_changes.csv                 one row per line changed in review (text, line speed)
+  qc_changes.csv                 one row per line changed in review (text, line speed set by the reviewer)
 
 File names and CSV formats come from ``v2.exporter`` so downstream steps can treat this ZIP like
 an AD version 2 output.
@@ -31,7 +32,7 @@ CHANGED_FILL = PatternFill("solid", fgColor="FFF2CC")  # Excel's pale yellow "ch
 CHANGE_FIELDS = ("excel_row", "character", "start_TCR", "script_dialogue", "reviewed_dialogue", "line_speed")
 
 
-def edited_workbook(source, target, sheet_name, edits, speeds):
+def edited_workbook(source, target, sheet_name, edits, speeds, fits):
     """Copy the workbook, writing reviewed text into TARGET DIALOGUE. Nothing else is touched."""
     book = load_workbook(source)  # full mode: keeps formatting, other sheets and columns as they are
     try:
@@ -45,7 +46,8 @@ def edited_workbook(source, target, sheet_name, edits, speeds):
                 cell.value = edits[row_key]["text"]
                 notes.append(f"Script wording: {edits[row_key]['original']}")
             if row_key in speeds:
-                notes.append(f"Line sped up to {speeds[row_key]:.2f}x in quality check.")
+                notes.append(f"Line speed set to {speeds[row_key]:.2f}x in quality check "
+                             f"(fitted speed was {fits.get(row_key, 1.0):.2f}x).")
             cell.fill = CHANGED_FILL
             cell.comment = Comment("\n".join(notes), "Dubbing Quality Check", width=320, height=110)
         book.save(target)
@@ -58,7 +60,8 @@ def build_export(folder, record, rows, out_path):
     folder = Path(folder)
     fps = record["fps"]
     edits = record.get("edits") or {}
-    speeds = record.get("line_speeds") or {}
+    speeds = record.get("line_speeds") or {}   # set by the reviewer
+    fits = {key: take["fit_speed"] for key, take in (record.get("takes") or {}).items()}
     episode = record["summary"]["episode"]
     index = {c["name"]: i for i, c in enumerate(record["summary"]["characters"])}
 
@@ -91,14 +94,15 @@ def build_export(folder, record, rows, out_path):
                                 actual_duration_ms=duration, overrun_amnt_ms=overrun,
                                 status="TCR_OUT_OVERRUN" if overrun else "OK", track=names[row.group],
                                 adjusted_start_TCR=format_tcr(p.start_ms, fps),
-                                adjusted_end_TCR=format_tcr(p.end_ms, fps)))
+                                adjusted_end_TCR=format_tcr(p.end_ms, fps),
+                                fit_speed=f"{speeds.get(str(row.row_number), fits.get(str(row.row_number), 1.0)):.2f}"))
         report = work / "processing_report.csv"
         write_report(report, sorted(records, key=lambda r: r["excel_row"]))
         files.append(report)
 
         stem = safe_component(Path(record["script"]["name"]).stem) or "script"
         workbook = work / f"{stem}_QC.xlsx"
-        edited_workbook(folder / "script.xlsx", workbook, record.get("sheet"), edits, speeds)
+        edited_workbook(folder / "script.xlsx", workbook, record.get("sheet"), edits, speeds, fits)
         files.append(workbook)
 
         by_row = {row.row_number: row for row in rows}
@@ -109,7 +113,7 @@ def build_export(folder, record, rows, out_path):
                             "start_TCR": format_tcr(row.start_ms, fps),
                             "script_dialogue": edits[key]["original"] if key in edits else row.text,
                             "reviewed_dialogue": row.text,
-                            "line_speed": f"{speeds.get(key, 1.0):.2f}x"})
+                            "line_speed": f"{speeds[key]:.2f}x" if key in speeds else ""})
         change_file = work / "qc_changes.csv"
         write_csv(change_file, changes, CHANGE_FIELDS)
         files.append(change_file)

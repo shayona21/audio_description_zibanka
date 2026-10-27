@@ -1,31 +1,35 @@
-"""Dub one episode with the AD version 2 engine, keeping every line as its own clip.
+"""Dub one episode with the AD version 2 engine (or import AD version 2's audio), keeping every
+line as its own clip.
 
-This is V2's pipeline (``v2/pipeline.py``) step for step: ElevenLabs per row, the speed dial,
-``place_dialogue`` for collisions, ``build_track`` per character. Differences, all needed by the
-review screen:
+Generating is V2's pipeline (``v2/pipeline.py``) step for step: ElevenLabs per row, pass 2 (each
+line fitted to its slot with FFmpeg, 0.70x to 1.50x), ``place_dialogue`` for collisions,
+``build_track`` per character. Importing takes the fitted line clips from an AD version 2 ZIP
+instead and goes straight to placing and building. Differences from V2, all needed by the review:
 
-* Each line's clip is kept in ``clips/<excel row>.wav`` (V2 discards them).
-* The run is resumable: a clip already on disk is reused, so retrying after an ElevenLabs error
+* Generating is resumable: a clip already on disk is reused, so retrying after an ElevenLabs error
   carries on from the failed line instead of paying for the earlier lines again.
-* One line can be regenerated later (``regenerate_line``) or sped up on its own
+* One line can be regenerated later (``regenerate_line``) or given another speed
   (``set_line_speed``): only that clip changes, the episode is re-placed with V2's rule, and only
   the tracks that actually changed are rebuilt.
 
-Each line has two files: ``clips/<row>.take.wav`` is the take as dubbed (ElevenLabs plus the
-episode speed dial) and ``clips/<row>.wav`` is what plays (the take, sped up if the reviewer chose a
-line speed). Line speed is always applied to the take, so changes never stack.
+Each line has two files: ``clips/<row>.take.wav`` is the take (ElevenLabs as delivered when
+generated here; V2's fitted clip when imported) and ``clips/<row>.wav`` is what plays (the take at
+the line's speed). Speeds are always measured against the natural ElevenLabs delivery and applied
+to the take, so changes never stack. Per line, the session records a ``take`` dict:
+``take_speed`` (speed the take file is already at), ``fit_speed`` (pass 2's choice) and
+``needed_speed`` (spoken length / slot with no limits, to tell the reviewer when even the limit
+does not make the line fit).
 """
 
 from array import array
 from collections import defaultdict
 import json
 from pathlib import Path
-import shutil
 import sys
 import wave
 
 from v2.audio_builder import build_track, read_clip
-from v2.audio_speed import adjust_audio_speed
+from v2.audio_speed import limit_speed, needed_speed, retime
 from v2.exporter import format_tcr
 from v2.timing import place_dialogue
 
@@ -70,10 +74,10 @@ def peaks_for(track_path):
     return list(out)
 
 
-def synthesize_line(folder, row, fps, speed, synthesize):
-    """One ElevenLabs request for one row, speed-adjusted. Returns the WAV bytes (not yet saved)."""
+def synthesize_line(row, fps, synthesize):
+    """One ElevenLabs request for one row. Returns the WAV bytes as delivered (not yet saved)."""
     try:
-        wav = adjust_audio_speed(synthesize(row.text, row.voice_id), speed)
+        wav = synthesize(row.text, row.voice_id)
         read_clip(wav)  # rejects empty or unreadable audio before anything is replaced
         return wav
     except DubCancelled:
@@ -83,16 +87,35 @@ def synthesize_line(folder, row, fps, speed, synthesize):
                        row=row.row_number) from exc
 
 
+def describe_take(wav, row, take_speed=1.0, fit=None):
+    """Speeds for a take. ``fit`` is pass 2's speed when already known (an imported V2 clip)."""
+    needed = needed_speed(wav, row.end_ms - row.start_ms, clip_speed=take_speed)
+    return {"take_speed": take_speed, "fit_speed": limit_speed(needed) if fit is None else fit,
+            "needed_speed": round(needed, 2)}
+
+
+def prepare_take(row, fps, wav, take_speed=1.0, fit=None):
+    """Pass 2 for a take: ``(take info, clip that plays)``; the clip is the take at its fit speed."""
+    try:
+        info = describe_take(wav, row, take_speed, fit)
+        clip = retime(wav, info["fit_speed"] / take_speed)
+        read_clip(clip)
+        return info, clip
+    except Exception as exc:
+        raise DubError(f"Row {row.row_number} ({row.character} at {format_tcr(row.start_ms, fps)}): "
+                       f"fitting the line to its slot failed: {exc}", row=row.row_number) from exc
+
+
 def _write(path, data):
     temp = path.with_name(path.name + ".partial")
     temp.write_bytes(data)
     temp.replace(path)  # a file on disk is always complete, which makes resuming safe
 
 
-def save_clip(folder, row_number, wav):
-    """Store a fresh take: it is both the take and (at line speed 1.00x) what plays."""
-    _write(take_path(folder, row_number), wav)
-    _write(clip_path(folder, row_number), wav)
+def save_take(folder, row_number, take, clip):
+    """Store a take and what plays. The clip is written last: its presence marks the line done."""
+    _write(take_path(folder, row_number), take)
+    _write(clip_path(folder, row_number), clip)
 
 
 def clip_lengths(folder, rows):
@@ -100,7 +123,7 @@ def clip_lengths(folder, rows):
     return {row.row_number: len(read_clip(clip_path(folder, row.row_number).read_bytes())) for row in rows}
 
 
-def assemble(folder, rows, summary, fps, speed, lengths, rebuild=None):
+def assemble(folder, rows, summary, fps, lengths, rebuild=None):
     """Place every line with V2's rule and (re)build character tracks; return the audio section.
 
     ``rebuild`` is the set of character names whose track must be rewritten; None means all.
@@ -136,8 +159,6 @@ def assemble(folder, rows, summary, fps, speed, lengths, rebuild=None):
     temp.write_text(json.dumps({"per_second": PEAKS_PER_SECOND, "tracks": peaks}), encoding="utf-8")
     temp.replace(peaks_file)
 
-    take_lengths = {row.row_number: len(read_clip(take_path(folder, row.row_number).read_bytes()))
-                    for row in rows if take_path(folder, row.row_number).is_file()}
     lines = []
     for p in sorted(placed, key=lambda p: (p.start_ms, p.row.row_number)):
         row = p.row
@@ -154,8 +175,6 @@ def assemble(folder, rows, summary, fps, speed, lengths, rebuild=None):
             "audio_end_ms": p.end_ms,
             "delay_ms": p.delay_ms,
             "overrun_ms": max(0, (p.end_ms - p.start_ms) - (row.end_ms - row.start_ms)),
-            # Length of the take as dubbed (line speed 1.00x): the basis for the suggested speed.
-            "take_ms": take_lengths.get(row.row_number, p.end_ms - p.start_ms),
         })
 
     over = sum(1 for line in lines if line["overrun_ms"])
@@ -168,7 +187,6 @@ def assemble(folder, rows, summary, fps, speed, lengths, rebuild=None):
                         "previous line ran long.")
     return {
         "sample_rate": rate,
-        "speed": speed,
         "duration_ms": episode_end,
         "tracks": tracks,
         "lines": lines,
@@ -178,30 +196,53 @@ def assemble(folder, rows, summary, fps, speed, lengths, rebuild=None):
     }
 
 
-def dub_episode(folder, rows, summary, fps, speed, synthesize, report=lambda **_: None,
-                cancelled=lambda: False):
-    """Generate (or resume) the episode's dub in ``folder``; return the session's audio section.
+def dub_episode(folder, rows, summary, fps, synthesize, report=lambda **_: None, cancelled=lambda: False):
+    """Generate (or resume) the episode's dub in ``folder``.
 
-    ``report(**state)`` receives progress: phase, done, total, current.
+    Returns ``(audio section, {row: take info})``. ``report(**state)`` receives progress: phase,
+    done, total, current.
     """
     folder = Path(folder)
     (folder / "clips").mkdir(parents=True, exist_ok=True)
     total = len(rows)
+    takes = {}
 
     # One ElevenLabs request per row, in script order, sequential like V2 (no automatic
-    # retries: a retried request may be billed twice).
+    # retries: a retried request may be billed twice). Each take is fitted to its slot at once.
     for done, row in enumerate(rows):
         if cancelled():
             raise DubCancelled()
         report(phase="dubbing", done=done, total=total, current=f"{row.character}, {format_tcr(row.start_ms, fps)}")
-        if not clip_path(folder, row.row_number).is_file():
-            save_clip(folder, row.row_number, synthesize_line(folder, row, fps, speed, synthesize))
+        if clip_path(folder, row.row_number).is_file():  # done before a retry: reuse, never pay twice
+            take = take_path(folder, row.row_number)
+            takes[row.row_number] = describe_take((take if take.is_file() else clip_path(folder, row.row_number))
+                                                  .read_bytes(), row)
+            continue
+        wav = synthesize_line(row, fps, synthesize)
+        takes[row.row_number], clip = prepare_take(row, fps, wav)
+        save_take(folder, row.row_number, wav, clip)
 
     report(phase="building", done=total, total=total, current="Building character tracks")
-    return assemble(folder, rows, summary, fps, speed, clip_lengths(folder, rows))
+    return assemble(folder, rows, summary, fps, clip_lengths(folder, rows)), takes
 
 
-def _replace_and_rebuild(folder, rows, summary, fps, speed, row_number, write, previous):
+def import_clips(folder, rows, fps, clips, fits):
+    """Store AD version 2's fitted line clips as the takes; returns ``{row: take info}``.
+
+    ``clips`` maps each row to its WAV bytes and ``fits`` to the speed V2 fitted it at, so the
+    take is already at that speed and plays as it is.
+    """
+    folder = Path(folder)
+    (folder / "clips").mkdir(parents=True, exist_ok=True)
+    takes = {}
+    for row in rows:
+        fit = fits[row.row_number]
+        takes[row.row_number], clip = prepare_take(row, fps, clips[row.row_number], take_speed=fit, fit=fit)
+        save_take(folder, row.row_number, clips[row.row_number], clip)
+    return takes
+
+
+def _replace_and_rebuild(folder, rows, summary, fps, row_number, write, previous):
     """Swap one line's audio (``write()`` does it) and rebuild only the tracks that changed.
 
     On any failure the line's files are restored, so clip and tracks stay consistent.
@@ -219,7 +260,7 @@ def _replace_and_rebuild(folder, rows, summary, fps, speed, row_number, write, p
         # All tracks share one length (V2 rule); if the episode end moves, every track changes.
         end = max(max(p.row.end_ms, p.end_ms) for p in place_dialogue(rows, lengths))
         rebuild = None if end != previous["duration_ms"] else {row.character}
-        audio = assemble(folder, rows, summary, fps, speed, lengths, rebuild=rebuild)
+        audio = assemble(folder, rows, summary, fps, lengths, rebuild=rebuild)
     except BaseException:
         for path, data in saved.items():
             _write(path, data)
@@ -234,20 +275,26 @@ def _replace_and_rebuild(folder, rows, summary, fps, speed, row_number, write, p
     return audio, changed, moved
 
 
-def regenerate_line(folder, rows, summary, fps, speed, synthesize, row_number, previous):
-    """Re-dub one row (``rows`` already carries its new text) as a new take at line speed 1.00x."""
+def regenerate_line(folder, rows, summary, fps, synthesize, row_number, previous):
+    """Re-dub one row (``rows`` already carries its new text) as a new take, fitted to its slot.
+
+    Returns ``(audio, changed_tracks, moved, take info)``.
+    """
     row = next(r for r in rows if r.row_number == row_number)
-    wav = synthesize_line(folder, row, fps, speed, synthesize)  # before touching any file
-    return _replace_and_rebuild(folder, rows, summary, fps, speed, row_number,
-                                lambda: save_clip(folder, row_number, wav), previous)
+    wav = synthesize_line(row, fps, synthesize)       # before touching any file
+    info, clip = prepare_take(row, fps, wav)
+    audio, changed, moved = _replace_and_rebuild(folder, rows, summary, fps, row_number,
+                                                 lambda: save_take(folder, row_number, wav, clip), previous)
+    return audio, changed, moved, info
 
 
-def set_line_speed(folder, rows, summary, fps, speed, row_number, factor, previous):
-    """Speed one line up from its take (1.00x restores the take exactly). No ElevenLabs request."""
+def set_line_speed(folder, rows, summary, fps, row_number, speed, take_speed, previous):
+    """Play one line at ``speed`` (relative to the natural take) from its take; the take's own
+    speed gives exactly the take back. No ElevenLabs request."""
     folder = Path(folder)
     take = take_path(folder, row_number)
-    if not take.is_file():  # sessions dubbed before line speed existed: the clip is the take
+    if not take.is_file():  # sessions dubbed before takes were kept: the clip is the take
         _write(take, clip_path(folder, row_number).read_bytes())
-    wav = adjust_audio_speed(take.read_bytes(), factor)  # validates the range; FFmpeg above 1.00x
-    return _replace_and_rebuild(folder, rows, summary, fps, speed, row_number,
+    wav = retime(take.read_bytes(), speed / take_speed)  # FFmpeg unless the ratio is 1
+    return _replace_and_rebuild(folder, rows, summary, fps, row_number,
                                 lambda: _write(clip_path(folder, row_number), wav), previous)

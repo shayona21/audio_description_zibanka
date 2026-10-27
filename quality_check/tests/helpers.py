@@ -50,15 +50,22 @@ def fake_voice(text, voice_id):
     return tone_wav(max(300, 45 * len(text)), freq=180.0 + 40 * (sum(map(ord, voice_id)) % 7))
 
 
-def dub_zip(tmp, rows, name="dub.zip"):
-    """Run the real V2 pipeline (needs pydub) and return the output ZIP's bytes."""
+# A second episode, so an AD version 2 run holds more than the episode under review.
+SECOND_EPISODE = [
+    ["2", 1, "00:00:02:00", "00:00:04:00", "KUHU", "voiceA", "Good morning."],
+    ["2", 2, "00:00:05:00", "00:00:06:00", "RAVI", "voiceC", "[Laughs] Not today, not ever, not in a hundred years."],
+]
+
+
+def dub_zip(tmp, rows, name="dub.zip", fps=25):
+    """Run the real V2 pipeline (needs pydub and FFmpeg) and return the output ZIP's bytes."""
     from v2.pipeline import run_pipeline
 
     tmp = Path(tmp)
     script = tmp / f"{name}.xlsx"
     script.write_bytes(workbook_bytes(rows))
     out = tmp / name
-    run_pipeline(script, out, fps=25, synthesize=fake_voice, progress=lambda _m: None)
+    run_pipeline(script, out, fps=fps, synthesize=fake_voice, progress=lambda _m: None)
     return out.read_bytes()
 
 

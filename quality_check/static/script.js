@@ -90,7 +90,9 @@ export class ScriptPanel {
         const badges = el('span', { className: 'badges' });
         if (line.edited) badges.append(el('span', { className: 'badge badge-edit', textContent: 'Edited', title: `Script: ${line.original}` }));
         if (line.overrun_ms) badges.append(el('span', { className: 'badge badge-over', textContent: `+${seconds(line.overrun_ms)}`, title: 'Audio runs past TCR OUT by this much' }));
-        if (line.line_speed && line.line_speed !== 1) badges.append(el('span', { className: 'badge badge-speed', textContent: `${line.line_speed.toFixed(2)}x`, title: 'Sped up from the dubbed take' }));
+        if (line.line_speed && line.line_speed !== 1) badges.append(el('span', {
+            className: `badge badge-speed${line.speed_set ? ' is-set' : ''}`, textContent: `${line.line_speed.toFixed(2)}x`,
+            title: line.speed_set ? 'Speed set in review' : 'Fitted to its slot (TCR IN to TCR OUT) by FFmpeg' }));
         if (line.delay_ms) badges.append(el('span', { className: 'badge badge-late', textContent: `late ${seconds(line.delay_ms)}`, title: "Starts late because this character's previous line ran long" }));
 
         const main = el('button', { type: 'button', className: 'line-main', title: 'Jump to this line' },

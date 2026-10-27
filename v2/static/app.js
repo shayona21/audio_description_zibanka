@@ -8,13 +8,6 @@ const submitLabel = byId('submit-label');
 const progressSection = byId('progress-section');
 const downloadSection = byId('download-section');
 const retry = byId('retry-btn');
-const speedDial = byId('speed-dial');
-const speedValue = byId('speed-value');
-function updateSpeedLabel() {
-    speedValue.textContent = Number(speedDial.value).toFixed(2) + 'x';
-}
-speedDial.addEventListener('input', updateSpeedLabel);
-updateSpeedLabel();
 let selectedFile = null;
 let busy = false;
 let activeJob = null;
@@ -35,7 +28,7 @@ function updateSubmitState() {
 
 function setBusy(value) {
     busy = value;
-    [fileInput, outputName, byId('fps'), byId('sheet-name'), speedDial].forEach(input => {
+    [fileInput, outputName, byId('fps'), byId('sheet-name')].forEach(input => {
         input.disabled = value;
     });
     uploadArea.classList.toggle('disabled', value);
@@ -146,7 +139,7 @@ async function pollStatus() {
             setProgress(100);
             byId('download-link').href = `/download/${activeJob}`;
             byId('output-file-name').textContent = data.download_name || 'AD_v2_output.zip';
-            byId('review-summary').textContent = `${data.tracks} tracks · ${data.flagged_rows} rows flagged for timing review`;
+            byId('review-summary').textContent = `${data.tracks} tracks · ${data.fitted_rows} rows fitted to their slot · ${data.flagged_rows} rows flagged for timing review`;
             downloadSection.style.display = 'block';
             rememberJob(null);
             activeJob = null;

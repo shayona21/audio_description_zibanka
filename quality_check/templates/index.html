@@ -28,11 +28,51 @@
 <main class="upload-view" id="upload-view">
     <div class="page-title">
         <h1>Dubbing Quality Check</h1>
-        <p>Add one episode's script and video. The script is dubbed with ElevenLabs, then you review it against the picture.</p>
+        <p>Add one episode's dub and video, then review the dub against the picture.</p>
     </div>
 
     <form id="upload-form" class="panel" novalidate>
+        <div class="source" role="radiogroup" aria-label="Where the dubbed audio comes from">
+            <button type="button" class="source-opt" role="radio" aria-checked="true" data-source="generate">
+                <b>Generate from the script</b>
+                <span>Dub the Excel with ElevenLabs now</span>
+            </button>
+            <button type="button" class="source-opt" role="radio" aria-checked="false" data-source="v2">
+                <b>Use AD Tool V2 audio</b>
+                <span>Review a run that is already dubbed</span>
+            </button>
+        </div>
+
         <div class="slots">
+            <!-- AD Tool V2 run: pick one on this server, or upload its ZIP -->
+            <div class="slot" id="run-slot" data-state="empty" hidden>
+                <input class="visually-hidden" type="file" id="run-input" accept=".zip,application/zip">
+                <div class="run-pick">
+                    <div class="run-pick-head">
+                        <svg class="drop-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+                        <span class="drop-title">AD Tool V2 run</span>
+                    </div>
+                    <ul class="run-list" id="run-list" aria-label="Finished AD Tool V2 runs"></ul>
+                    <label class="run-upload" for="run-input"><span>Or drop its ZIP here, or <u>browse</u></span>
+                        <span class="drop-meta">.zip from AD Tool V2, up to {{ max_run_mb }} MB</span></label>
+                </div>
+                <div class="filled" aria-live="polite">
+                    <div class="filled-head">
+                        <span class="status-dot" aria-hidden="true"></span>
+                        <div class="filled-name">
+                            <strong id="run-name"></strong>
+                            <span id="run-size"></span>
+                        </div>
+                        <button type="button" class="link-btn" data-replace="run">Change</button>
+                        <button type="button" class="icon-btn" data-clear="run" aria-label="Remove run">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+                        </button>
+                    </div>
+                    <div class="filled-body" id="run-body"></div>
+                    <div class="slot-progress" aria-hidden="true"><div class="slot-progress-bar" id="run-progress"></div></div>
+                </div>
+            </div>
+
             {% for slot in [
                 {'kind': 'script', 'title': 'Script', 'hint': 'Drop the Excel here, or', 'meta': '.xlsx, one episode, up to ' ~ max_script_mb ~ ' MB',
                  'accept': '.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -92,20 +132,18 @@
                 </select>
             </label>
             <label class="field">
-                <span>Speed dial <output id="speed-value" for="speed">1.00x</output></span>
-                <input id="speed" type="range" min="1.00" max="{{ '%.2f' | format(max_speed) }}" step="0.01" value="1.00">
-                <small>Speeds lines up with pitch preserved, as in AD version 2. Needs FFmpeg above 1.00x.</small>
-            </label>
-            <label class="field">
                 <span>Worksheet</span>
                 <input id="sheet-name" type="text" placeholder="First worksheet" autocomplete="off" spellcheck="false">
             </label>
         </div>
 
         <div class="format-help" id="format-help" hidden>
-            <p><b>Script</b>: the same workbook format as AD version 2, for one episode. Headers in row 1:
-                EP NO, TCR IN, TCR OUT, CHARACTERS, VOICE ID and TARGET DIALOGUE.</p>
-            <p>Each line is sent to ElevenLabs with its VOICE ID and audio tags such as [laughing], exactly as AD version 2 does.</p>
+            <p><b>Generate</b>: the script in the same workbook format as AD version 2, for one episode. Headers in row 1:
+                EP NO, TCR IN, TCR OUT, CHARACTERS, VOICE ID and TARGET DIALOGUE. Each line is sent to ElevenLabs with
+                its VOICE ID and audio tags such as [laughing], then fitted to its slot with FFmpeg (0.70x to 1.50x),
+                exactly as AD version 2 does.</p>
+            <p><b>AD Tool V2 audio</b>: a finished run on this server, or the ZIP AD Tool V2 delivered. Pick the episode;
+                its lines are used as AD Tool V2 made them, with no new ElevenLabs request. The frame rate is the run's own.</p>
             <p><b>Video</b>: the episode picture, starting at 00:00:00:00 like the dubbed tracks.</p>
         </div>
 
@@ -128,7 +166,7 @@
         <div class="job" id="job-dub" data-state="running">
             <div class="job-head">
                 <span class="status-dot" aria-hidden="true"></span>
-                <h2>Dubbing with ElevenLabs</h2>
+                <h2 id="dub-heading">Dubbing with ElevenLabs</h2>
                 <span class="job-count" id="dub-count"></span>
             </div>
             <div class="job-track"><div class="job-bar" id="dub-bar"></div></div>
@@ -238,9 +276,9 @@
                 <span class="mix-label">Dub sound</span>
                 <input type="range" id="master-volume" min="0" max="1.5" step="0.01" value="1" aria-label="Dub sound volume">
             </label>
-            <label class="mix line-speed" id="line-speed-box" title="Select a line in the script to speed it up">
+            <label class="mix line-speed" id="line-speed-box" title="Select a line in the script to change its speed">
                 <span class="mix-label" id="line-speed-label">Line speed</span>
-                <input type="range" id="line-speed" min="1.00" max="{{ '%.2f' | format(max_speed) }}" step="0.01" value="1.00" disabled aria-describedby="line-speed-value">
+                <input type="range" id="line-speed" min="{{ '%.2f' | format(min_speed) }}" max="{{ '%.2f' | format(max_speed) }}" step="0.01" value="1.00" disabled aria-describedby="line-speed-value">
                 <output id="line-speed-value" for="line-speed">Select a line</output>
                 <span class="suggested" id="line-speed-suggested" hidden></span>
             </label>

@@ -4,7 +4,7 @@ import { ScriptPanel, renderDialogue } from './script.js';
 
 const $ = id => document.getElementById(id);
 const MB = 1024 * 1024;
-const LIMITS = { script: 20 * MB, video: 500 * MB };
+const LIMITS = { script: 20 * MB, video: 500 * MB, run: 500 * MB };
 const POLL_MS = 800;
 const PREROLL = 0.75;     // seconds of picture before a line when auditioning it
 const POSTROLL = 0.4;     // and after it
@@ -16,7 +16,11 @@ const CAST_COLOURS = ['#2563a8', '#d9480f', '#2b8a3e', '#9c36b5', '#c2255c',
 const colourFor = i => CAST_COLOURS[i % CAST_COLOURS.length];
 
 const state = {
+    source: 'generate',   // 'generate': dub the script here; 'v2': review an AD Tool V2 run
     script: { file: null, status: 'empty', summary: null, error: '', check: 0 },
+    // The chosen AD Tool V2 run: details = { id, name, fps, episodes: [summary] }
+    run: { status: 'empty', id: null, name: '', meta: '', details: null, episode: null, error: '', check: 0, xhr: null },
+    runs: { status: 'idle', list: [] },     // finished runs on this server
     video: { file: null, status: 'empty', durationMs: null, error: '', url: null },
     dub: null,            // { id, record, upload: {status, loaded, total, error}, poll }
     session: null,
@@ -90,16 +94,10 @@ function send(url, formData, onProgress) {
 
 /* ================================================================ settings */
 
-function speedValue() { return Number($('speed').value).toFixed(2); }
 function settingsText() {
     const sheet = $('sheet-name').value.trim();
-    const speed = speedValue() === '1.00' ? '' : `, ${speedValue()}x speed`;
-    return `${$('fps').value} fps${speed}, ${sheet ? `worksheet "${sheet}"` : 'first worksheet'}`;
+    return `${$('fps').value} fps, ${sheet ? `worksheet "${sheet}"` : 'first worksheet'}`;
 }
-$('speed').addEventListener('input', () => {
-    $('speed-value').textContent = `${speedValue()}x`;
-    $('settings-summary').textContent = settingsText();
-});
 $('settings-toggle').addEventListener('click', () => {
     const open = $('settings').hidden;
     $('settings').hidden = !open;
@@ -127,7 +125,11 @@ function settingsForm(form) {
 
 /* ================================================================ script */
 
-function recheckScript() { if (state.script.file) checkScript(state.script.file); }
+function recheckScript() {
+    if (state.script.file) checkScript(state.script.file);
+    // An uploaded ZIP is read with the settings (its frame rate is found from its report anyway).
+    if (state.run.id && state.run.id.startsWith('up-') && state.run.status !== 'checking') readRun(state.run.id);
+}
 
 async function checkScript(file) {
     const check = ++state.script.check; // answers to superseded checks are ignored
@@ -162,6 +164,164 @@ function selectScript(file) {
         return;
     }
     checkScript(file);
+}
+
+/* ================================================================ source and AD Tool V2 run */
+
+function setSource(source) {
+    state.source = source;
+    document.querySelectorAll('[data-source]').forEach(btn =>
+        btn.setAttribute('aria-checked', String(btn.dataset.source === source)));
+    $('script-slot').hidden = source !== 'generate';
+    $('run-slot').hidden = source !== 'v2';
+    $('form-error').hidden = true;
+    if (source === 'v2' && state.runs.status !== 'loading') loadRuns();
+    render();
+}
+document.querySelectorAll('[data-source]').forEach(btn =>
+    btn.addEventListener('click', () => setSource(btn.dataset.source)));
+
+function dateText(seconds) {
+    if (!seconds) return '';
+    return new Date(seconds * 1000).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+}
+
+async function loadRuns() {
+    state.runs.status = 'loading';
+    renderRunList();
+    try {
+        const response = await fetch('/v2-runs', { cache: 'no-store' });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error);
+        state.runs = { status: 'ok', list: body.runs };
+    } catch (_) {
+        state.runs = { status: 'error', list: [] };
+    }
+    renderRunList();
+}
+
+function renderRunList() {
+    const { status, list } = state.runs;
+    if (status !== 'ok' || !list.length) {
+        const text = status === 'loading' ? 'Looking for finished runs…'
+            : status === 'error' ? "Couldn't list the runs on this server. Upload the ZIP instead."
+            : 'No finished AD Tool V2 runs on this server yet. Upload a ZIP instead.';
+        $('run-list').replaceChildren(el('li', { className: 'run-empty' }, text));
+        return;
+    }
+    $('run-list').replaceChildren(...list.map(run => {
+        const episodes = run.episodes.length === 1 ? `Episode ${run.episodes[0]}` : `${run.episodes.length} episodes`;
+        const meta = `${episodes}, ${dateText(run.finished)}`;
+        const button = el('button', { type: 'button', className: 'run-item', title: `${run.name}: ${plural(run.rows || 0, 'line')}, ${run.fps} fps` },
+            el('b', {}, run.name), el('span', {}, meta));
+        button.addEventListener('click', () => {
+            Object.assign(state.run, { name: run.name, meta });
+            readRun(run.id);
+        });
+        return el('li', {}, button);
+    }));
+}
+
+/** Read a run's episodes from the server (a run on this server, or a ZIP uploaded before). */
+async function readRun(id) {
+    const run = state.run;
+    if (run.xhr) { run.xhr.abort(); run.xhr = null; }   // a ZIP still uploading is replaced
+    const check = ++run.check;
+    Object.assign(run, { id, status: 'checking', details: null, error: '' });
+    render();
+    const query = new URLSearchParams({ fps: $('fps').value, sheet: $('sheet-name').value });
+    let result;
+    try {
+        const response = await fetch(`/v2-runs/${id}?${query}`, { cache: 'no-store' });
+        const body = await response.json().catch(() => ({}));
+        result = response.ok ? { details: body } : { error: body.error || `The server could not read this run (HTTP ${response.status}).` };
+    } catch (_) {
+        result = { error: 'The server is not responding. Check the app is running, then try again.' };
+    }
+    if (check !== run.check) return;
+    setRunResult(result);
+}
+
+function setRunResult({ details, error }) {
+    const run = state.run;
+    if (details) {
+        const keep = details.episodes.some(e => e.episode === run.episode);
+        Object.assign(run, { status: 'ok', details, error: '', episode: keep ? run.episode : details.episodes[0].episode });
+    } else {
+        Object.assign(run, { status: 'error', details: null, error });
+    }
+    render();
+}
+
+function uploadRun(file) {
+    if (!file) return;
+    $('form-error').hidden = true;
+    const run = state.run;
+    if (run.xhr) run.xhr.abort();
+    const check = ++run.check;
+    Object.assign(run, { id: null, name: file.name, meta: sizeText(file.size), details: null, error: '' });
+    if (extOf(file.name) !== '.zip') {
+        Object.assign(run, { status: 'error', error: 'This is not a ZIP. Upload the ZIP that AD Tool V2 delivered.' });
+        render();
+        return;
+    }
+    if (file.size > LIMITS.run) {
+        Object.assign(run, { status: 'error', error: `The ZIP is ${sizeText(file.size)}; the limit is 500 MB.` });
+        render();
+        return;
+    }
+    run.status = 'checking';
+    render();
+    const form = settingsForm(new FormData());
+    form.append('dub', file);
+    const job = send('/v2-runs', form, (loaded, total) => {
+        if (check === run.check) $('run-progress').style.width = `${Math.round(loaded / total * 100)}%`;
+    });
+    run.xhr = job.xhr;
+    job.promise.then(details => {
+        if (check !== run.check) return;
+        run.xhr = null;
+        run.id = details.id;
+        setRunResult({ details });
+    }, error => {
+        if (check !== run.check || error.aborted) return;
+        run.xhr = null;
+        setRunResult({ error: error.message });
+    });
+}
+
+function runSummary() {
+    const run = state.run;
+    if (run.status !== 'ok') return null;
+    return run.details.episodes.find(e => e.episode === run.episode) || null;
+}
+
+function renderRunSlot() {
+    const run = state.run;
+    $('run-progress').style.width = run.status === 'checking' && !run.id ? $('run-progress').style.width : '0';
+    let body = [];
+    if (run.status === 'checking') body = [el('p', { className: 'checking' }, run.id ? 'Reading the run…' : 'Uploading and reading the ZIP…')];
+    else if (run.status === 'error') body = errorBody("This run can't be used", run.error);
+    else if (run.status === 'ok') {
+        const s = runSummary();
+        const episodes = run.details.episodes;
+        if (episodes.length > 1) {
+            const select = el('select', { id: 'run-episode' }, ...episodes.map(e =>
+                el('option', { value: e.episode, selected: e.episode === run.episode }, `Episode ${e.episode} (${plural(e.lines, 'line')})`)));
+            select.addEventListener('change', () => { run.episode = select.value; render(); });
+            body.push(el('label', { className: 'field' }, el('span', {}, `Episode (${episodes.length} in this run)`), select));
+        } else {
+            body.push(el('p', { className: 'headline' }, `Episode ${s.episode}`));
+        }
+        body.push(el('p', { className: 'sub' }, `${plural(s.lines, 'line')}, ${plural(s.characters.length, 'character')}, ${run.details.fps} fps`),
+                  el('p', { className: 'sub tc' }, `${s.first_start_tcr} to ${s.last_end_tcr}`));
+    }
+    const slot = $('run-slot');
+    slot.dataset.state = run.status;
+    slot.classList.toggle('is-busy', run.status === 'checking');
+    $('run-name').textContent = run.name;
+    $('run-size').textContent = run.meta;
+    $('run-body').replaceChildren(...body);
 }
 
 /* ================================================================ video */
@@ -204,7 +364,12 @@ function selectVideo(file) {
 /* ================================================================ slots: replace, clear, drop */
 
 function clearSlot(kind) {
-    if (kind === 'script') {
+    if (kind === 'run') {
+        if (state.run.xhr) state.run.xhr.abort();
+        Object.assign(state.run, { status: 'empty', id: null, name: '', meta: '', details: null, episode: null,
+                                   error: '', check: state.run.check + 1, xhr: null });
+        if (state.source === 'v2') loadRuns();  // runs finished since the list was read
+    } else if (kind === 'script') {
         state.script.check++;
         Object.assign(state.script, { file: null, status: 'empty', summary: null, error: '' });
     } else {
@@ -214,8 +379,8 @@ function clearSlot(kind) {
     render();
 }
 
-const select = { script: selectScript, video: selectVideo };
-['script', 'video'].forEach(kind => {
+const select = { script: selectScript, video: selectVideo, run: uploadRun };
+['script', 'video', 'run'].forEach(kind => {
     const input = $(`${kind}-input`);
     const slot = $(`${kind}-slot`);
     input.addEventListener('change', () => { select[kind](input.files[0]); input.value = ''; });
@@ -232,8 +397,10 @@ const select = { script: selectScript, video: selectVideo };
         if (event.dataTransfer.files.length) select[kind](event.dataTransfer.files[0]);
     });
 });
-document.querySelectorAll('[data-replace]').forEach(btn =>
-    btn.addEventListener('click', () => $(`${btn.dataset.replace}-input`).click()));
+document.querySelectorAll('[data-replace]').forEach(btn => btn.addEventListener('click', () => {
+    if (btn.dataset.replace === 'run') clearSlot('run');   // back to the list of runs
+    else $(`${btn.dataset.replace}-input`).click();
+}));
 document.querySelectorAll('[data-clear]').forEach(btn =>
     btn.addEventListener('click', () => clearSlot(btn.dataset.clear)));
 window.addEventListener('dragover', event => event.preventDefault());
@@ -300,6 +467,7 @@ function renderSlot(kind, slotState, body) {
 
 function render() {
     const { script, video } = state;
+    const fromRun = state.source === 'v2';
 
     let body = [];
     if (script.status === 'checking') body = [el('p', { className: 'checking' }, 'Checking the script…')];
@@ -310,6 +478,10 @@ function render() {
                 el('p', { className: 'sub tc' }, `${s.first_start_tcr} to ${s.last_end_tcr}`)];
     } else if (script.status === 'error') body = errorBody("This script can't be used", script.error);
     renderSlot('script', script.status, body);
+    renderRunSlot();
+    // What the episode's dub comes from: the script (generate) or the chosen run's episode.
+    const dub = fromRun ? { status: state.run.status, summary: runSummary() } : script;
+    const noun = fromRun ? 'run' : 'script';
 
     body = [];
     if (video.status === 'checking') body = [el('p', { className: 'checking' }, 'Reading the video…')];
@@ -317,25 +489,25 @@ function render() {
     else if (video.status === 'error') body = errorBody("This video can't be used", video.error);
     let videoState = video.status;
 
-    $('upload-fit').hidden = script.status !== 'ok';
-    if (script.status === 'ok') {
+    $('upload-fit').hidden = dub.status !== 'ok';
+    if (dub.status === 'ok') {
         const videoMs = video.status === 'ok' ? video.durationMs : NaN;
-        drawStrip($('upload-strip'), script.summary, videoMs);
-        if (writeFitNote($('upload-fit-note'), script.summary, videoMs) === 'warn') videoState = 'warn';
+        drawStrip($('upload-strip'), dub.summary, videoMs);
+        if (writeFitNote($('upload-fit-note'), dub.summary, videoMs) === 'warn') videoState = 'warn';
     }
     renderSlot('video', videoState, body);
 
-    const ready = script.status === 'ok' && video.status === 'ok';
+    const ready = dub.status === 'ok' && video.status === 'ok';
     $('load-btn').disabled = !ready;
     let label;
-    if (script.status === 'checking') label = 'Checking the script…';
-    else if (script.status === 'error') label = 'Fix the script to continue';
+    if (dub.status === 'checking') label = fromRun ? 'Reading the run…' : 'Checking the script…';
+    else if (dub.status === 'error') label = fromRun ? 'Choose a run that can be used' : 'Fix the script to continue';
     else if (video.status === 'error') label = 'Add a playable video to continue';
-    else if (script.status === 'empty' && video.status === 'empty') label = 'Add the script and video to continue';
-    else if (script.status === 'empty') label = 'Add the script to continue';
+    else if (dub.status === 'empty' && video.status === 'empty') label = fromRun ? 'Choose a run and add the video to continue' : 'Add the script and video to continue';
+    else if (dub.status === 'empty') label = fromRun ? 'Choose a run to continue' : `Add the ${noun} to continue`;
     else if (video.status === 'empty') label = 'Add the video to continue';
     else if (video.status === 'checking') label = 'Reading the video…';
-    else label = `Dub episode ${script.summary.episode} (${plural(script.summary.lines, 'line')})`;
+    else label = `${fromRun ? 'Review' : 'Dub'} episode ${dub.summary.episode} (${plural(dub.summary.lines, 'line')})`;
     $('load-label').textContent = label;
 }
 
@@ -356,8 +528,13 @@ $('upload-form').addEventListener('submit', async event => {
     $('load-btn').disabled = true;
     $('load-label').textContent = 'Starting…';
     const form = settingsForm(new FormData());
-    form.append('script', state.script.file);
-    form.append('speed', speedValue());
+    if (state.source === 'v2') {
+        form.append('source', 'v2');
+        form.append('run', state.run.id);
+        form.append('episode', state.run.episode);
+    } else {
+        form.append('script', state.script.file);
+    }
     let record;
     try {
         const response = await fetch('/sessions', { method: 'POST', body: form });
@@ -377,7 +554,10 @@ function startDubView(record, videoFile) {
     stopPolling();
     state.dub = { id: record.session_id, record, upload: { status: 'idle', loaded: 0, total: 0, error: '' }, poll: 0, xhr: null };
     try { sessionStorage.setItem('qc-session', record.session_id); } catch (_) { /* optional */ }
-    $('dub-title').textContent = `Dubbing episode ${record.summary.episode}`;
+    const fromRun = record.source === 'v2';
+    $('dub-title').textContent = `${fromRun ? 'Preparing' : 'Dubbing'} episode ${record.summary.episode}`;
+    $('dub-heading').textContent = fromRun ? 'Building tracks from AD Tool V2 audio' : 'Dubbing with ElevenLabs';
+    $('dub-retry').textContent = fromRun ? 'Try again' : 'Retry from this line';
     showView('dub');
     if (record.video) state.dub.upload.status = 'done';
     else if (videoFile) uploadVideo(videoFile);
@@ -532,9 +712,12 @@ function setStep(active) {
     });
 }
 
-function renderNotes(audio) {
-    const speed = audio.speed && audio.speed !== 1 ? ` at ${audio.speed.toFixed(2)}x speed` : '';
-    const notes = [el('li', { className: 'note-ok' }, `${plural(audio.lines.length, 'line')} dubbed on ${plural(audio.tracks.length, 'character track')}${speed}.`)];
+function renderNotes(session) {
+    const audio = session.audio;
+    const from = session.source === 'v2' ? ` from AD Tool V2 (${session.run.name})` : ' with ElevenLabs';
+    const notes = [el('li', { className: 'note-ok' }, `${plural(audio.lines.length, 'line')} dubbed${from}, on ${plural(audio.tracks.length, 'character track')}.`)];
+    const fitted = audio.lines.filter(l => l.fit_speed !== 1).length;
+    if (fitted) notes.push(el('li', { className: 'note-ok' }, `${plural(fitted, 'line')} fitted to ${fitted === 1 ? 'its slot' : 'their slots'} by FFmpeg (${SPEED_MIN.toFixed(2)}x to ${SPEED_MAX.toFixed(2)}x).`));
     for (const warning of audio.warnings) notes.push(el('li', { className: 'note-warn' }, warning));
     $('import-notes').replaceChildren(...notes);
 }
@@ -560,7 +743,7 @@ async function openReview(session) {
 
     $('episode-title').textContent = `Episode ${s.episode}`;
     renderFacts(session);
-    renderNotes(audio);
+    renderNotes(session);
     $('file-meta').replaceChildren(
         `${session.script.name} (${session.script.size})`, el('br'),
         `${session.video.name} (${session.video.size})`);
@@ -728,7 +911,7 @@ async function applyLineChange(body, row, verb) {
     state.lanes.update({ lines: body.audio.lines, peaks, duration: player.duration });
     state.panel.setLines(body.audio.lines);
     renderFacts(body);
-    renderNotes(body.audio);
+    renderNotes(body);
     updateSpeedControl();
     $('tc-total').textContent = `/ ${timecode(player.duration, body.summary.fps)}`;
 
@@ -749,6 +932,8 @@ async function applyLineChange(body, row, verb) {
 /* ================================================================ line speed */
 
 const HAS_FFMPEG = document.body.dataset.ffmpeg === 'yes';
+const SPEED_MIN = Number($('line-speed').min);
+const SPEED_MAX = Number($('line-speed').max);
 let speedTimer = 0;
 let speedBusy = false;
 
@@ -758,27 +943,21 @@ function selectedLine() {
 }
 
 /**
- * Suggested speed for a line: the dubbed take's length divided by its slot (TCR OUT - TCR IN),
- * rounded up to 0.01x so that speed would make it fit; 1.00x when it already fits. A calculation
- * only: it never changes the audio. The take is the line at 1.00x, so moving the slider does not
- * change the suggestion.
+ * Suggested speed for a line: pass 2's fit, computed on the server from the take's spoken length
+ * and the slot (TCR OUT - TCR IN), held between the limits; 1.00x when the line already fits. A
+ * suggestion only: the reviewer decides with the slider. Shown in amber when even the limit does
+ * not make the line fit.
  */
-function suggestedSpeed(line) {
-    const slot = line.end_ms - line.start_ms;
-    const take = line.take_ms ?? (line.audio_end_ms - line.audio_start_ms) * (line.line_speed || 1);
-    return Math.max(1, Math.ceil(take / slot * 100 - 1e-6) / 100);
-}
-
 function showSuggestion(line) {
     const box = $('line-speed-suggested');
     if (!line) { box.hidden = true; return; }
-    const speed = suggestedSpeed(line);
-    const limit = Number($('line-speed').max);
+    const speed = line.fit_speed;
+    const held = line.needed_speed > SPEED_MAX || line.needed_speed < SPEED_MIN;
     box.hidden = false;
-    box.classList.toggle('is-over', speed > limit);
+    box.classList.toggle('is-over', held);
     box.replaceChildren('Suggested speed: ', el('b', {}, `${speed.toFixed(2)}x`));
-    box.title = speed > limit
-        ? `Row ${line.row} would need ${speed.toFixed(2)}x to fit between TCR IN and TCR OUT, above the ${limit.toFixed(2)}x limit.`
+    box.title = held
+        ? `Row ${line.row} would need ${line.needed_speed.toFixed(2)}x to fit between TCR IN and TCR OUT; ${speed.toFixed(2)}x is the limit.`
         : `Row ${line.row} fits between TCR IN and TCR OUT at ${speed.toFixed(2)}x. This is a suggestion only.`;
 }
 
@@ -794,13 +973,13 @@ function updateSpeedControl() {
         slider.value = '1.00';
         $('line-speed-label').textContent = 'Line speed';
         $('line-speed-value').textContent = 'Select a line';
-        box.title = 'Select a line in the script to speed it up';
+        box.title = 'Select a line in the script to change its speed';
         return;
     }
-    slider.value = String(line.line_speed || 1);
+    slider.value = String(line.line_speed);
     $('line-speed-label').textContent = `Row ${line.row} speed`;
     $('line-speed-value').textContent = `${Number(slider.value).toFixed(2)}x`;
-    box.title = HAS_FFMPEG ? `Speed up row ${line.row} (${line.character}); its start stays where it is`
+    box.title = HAS_FFMPEG ? `Change the speed of row ${line.row} (${line.character}); its start stays where it is`
         : 'Line speed needs FFmpeg installed on the server';
     if (!HAS_FFMPEG) $('line-speed-value').textContent = 'Needs FFmpeg';
 }
@@ -817,7 +996,7 @@ $('line-speed').addEventListener('change', () => {
 async function applyLineSpeed() {
     const line = selectedLine();
     const value = Number(Number($('line-speed').value).toFixed(2));
-    if (!line || speedBusy || value === (line.line_speed || 1)) return;
+    if (!line || speedBusy || value === line.line_speed) return;
     const session = state.session;
     speedBusy = true;
     $('line-speed-box').classList.add('is-busy');
@@ -827,7 +1006,8 @@ async function applyLineSpeed() {
         const body = await postLine(`/session/${session.session_id}/lines/${line.row}/speed`, { speed: value });
         if (state.session !== session) return;
         speedBusy = false;
-        await applyLineChange(body, line.row, value === 1 ? 'is back to its dubbed speed' : `sped up to ${value.toFixed(2)}x`);
+        await applyLineChange(body, line.row, value === line.fit_speed
+            ? `is back to its fitted speed (${value.toFixed(2)}x)` : `set to ${value.toFixed(2)}x`);
     } catch (error) {
         toast(`Line speed not changed: ${error.message}`);
     } finally {
@@ -860,8 +1040,8 @@ function openExport() {
     if (!session || !session.audio) return;
     const audio = session.audio;
     const edited = audio.lines.filter(l => l.edited).length;
-    const sped = audio.lines.filter(l => l.line_speed && l.line_speed !== 1).length;
-    const changed = audio.lines.filter(l => l.edited || (l.line_speed && l.line_speed !== 1)).length;
+    const sped = audio.lines.filter(l => l.speed_set).length;
+    const changed = audio.lines.filter(l => l.edited || l.speed_set).length;
     const stem = session.script.name.replace(/\.xlsx$/i, '');
     const item = (title, detail) => el('li', {}, el('b', {}, title), el('span', {}, detail));
     $('export-title').textContent = `Export episode ${session.summary.episode}`;
@@ -977,6 +1157,7 @@ $('reset-btn').addEventListener('click', () => {
     discardSession(id);
     state.session = null;
     clearSlot('script');
+    clearSlot('run');
     clearSlot('video');
     backToUpload();
 });
