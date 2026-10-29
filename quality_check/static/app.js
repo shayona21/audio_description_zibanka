@@ -1049,7 +1049,7 @@ function openExport() {
         item(`${plural(audio.tracks.length, 'character track')} (.wav)`,
              `${audio.sample_rate / 1000} kHz mono, as you heard them in the review`),
         item('Timeline and processing report (.csv)', 'Same columns as AD version 2, with the reviewed timings'),
-        item(`${stem}_QC.xlsx`, edited
+        item(`${stem}_qc.xlsx`, edited
             ? `${plural(edited, 'edited line')} written into TARGET DIALOGUE, highlighted, with the script wording in a note`
             : 'No lines edited: the script as uploaded'),
         item('qc_changes.csv', changed

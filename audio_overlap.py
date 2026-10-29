@@ -1,59 +1,85 @@
-"""Repair small dialogue overlaps without changing pitch or cutting speech."""
+"""Fix narration overlaps: speed a line up if that is enough, else play it after the previous line.
 
-from dataclasses import dataclass
+Audio description has one narrator, so two lines must never play at once. Lines are handled
+in start-time order. For each line:
+
+1. Overlap: the line would still be playing when the next line's start timecode arrives.
+2. The speed that fixes it = the line's length / the time it has before the next line starts.
+3. If that speed is below MAX_FIX_SPEED (1.5x), the line is sped up with FFmpeg (pitch
+   preserved) and keeps its start.
+4. If not, the line keeps its normal speed and the next line starts SEQUENTIAL_GAP_MS
+   (0.5 s) after it ends.
+
+The fix speed is on top of the speed dial.
+"""
 
 from audio_builder import audio_duration_ms
-from audio_speed import MAX_SPEED_RATE, adjust_audio_speed
+from audio_speed import apply_tempo
+
+MAX_FIX_SPEED = 1.5        # a line is only sped up when the fix needs less than this
+SEQUENTIAL_GAP_MS = 500    # gap after a line when the next line has to wait for it
 
 
-@dataclass
-class OverlapResult:
-    audio: bytes
-    duration_ms: int
-    speed: float
-    repaired: bool = False
-    reason: str | None = None
+def fit_to_window(wav_bytes, window_ms):
+    """Speed the clip up so it ends within ``window_ms``; returns (wav, speed) or None.
 
-
-def repair_overlap(output_wav, available_ms):
-    """Fit eligible output with additional speed strictly below 1.20x.
-
-    Each attempt uses the same clip after the user's speed dial adjustment.
-    If repair fails, retain that clip in full for editing.
+    atempo can leave a clip a few ms long, so the speed is re-measured and raised (up to
+    three tries), always staying below MAX_FIX_SPEED.
     """
-    duration_ms = audio_duration_ms(output_wav)
-    unchanged = OverlapResult(output_wav, duration_ms, 1.0)
-    if available_ms is None or duration_ms <= available_ms:
-        return unchanged
+    length_ms = audio_duration_ms(wav_bytes)
+    speed = length_ms / window_ms if window_ms > 0 else float("inf")
+    for _ in range(3):
+        if speed >= MAX_FIX_SPEED:
+            return None
+        fitted = apply_tempo(wav_bytes, speed)
+        fitted_ms = audio_duration_ms(fitted)
+        if fitted_ms <= window_ms:
+            return fitted, speed
+        speed *= (fitted_ms + 1) / window_ms
+    return None
 
-    overlap_ms = duration_ms - available_ms
-    if duration_ms <= 0 or available_ms <= 0 or overlap_ms * 10 >= duration_ms:
-        unchanged.reason = "Overlap is at least 10% of the clip length."
-        return unchanged
 
-    required_speed = duration_ms / available_ms
-    for _ in range(4):
-        if required_speed >= MAX_SPEED_RATE:
-            unchanged.reason = "Required additional speed is not below 1.20x."
-            return unchanged
-        try:
-            repaired_wav = adjust_audio_speed(output_wav, required_speed)
-            repaired_ms = audio_duration_ms(repaired_wav)
-        except RuntimeError as exc:
-            unchanged.reason = f"Automatic speed adjustment unavailable: {exc}"
-            return unchanged
-        if repaired_ms <= 0:
-            unchanged.reason = "Speed adjustment produced an empty clip."
-            return unchanged
-        if repaired_ms <= available_ms:
-            return OverlapResult(repaired_wav, repaired_ms, required_speed, repaired=True)
+def fix_overlaps(ad_rows, audio_clips, progress_callback=print):
+    """Apply the rule above to rows sorted by start time; returns (clips, start times in ms)."""
+    clips, starts = [], []
+    previous_end_ms = None
+    for i, (row, clip) in enumerate(zip(ad_rows, audio_clips)):
+        # Step 4 for the previous line: wait until it has finished, plus the gap.
+        start_ms = row["start_ms"]
+        if previous_end_ms is not None and start_ms < previous_end_ms:
+            start_ms = previous_end_ms + SEQUENTIAL_GAP_MS
+            progress_callback(
+                f"OVERLAP — Row {row['row_number']} placed after the previous line: "
+                f"starts {(start_ms - row['start_ms']) / 1000:.2f}s later than its start timecode."
+            )
 
-        # Tempo processing can leave a small residual overlap. Recalculate
-        # against the measured result, with a 1ms margin, without trimming it.
-        required_speed = max(
-            required_speed + 0.001,
-            required_speed * (repaired_ms + 1) / available_ms,
-        )
+        # Steps 1-3: does this line run into the next one, and can a speed-up fix it?
+        length_ms = audio_duration_ms(clip)
+        if i + 1 < len(ad_rows):
+            window_ms = ad_rows[i + 1]["start_ms"] - start_ms
+            if length_ms > window_ms:
+                needed = length_ms / window_ms if window_ms > 0 else float("inf")
+                try:
+                    fitted = fit_to_window(clip, window_ms)
+                except RuntimeError as exc:  # FFmpeg missing or failed: place sequentially
+                    fitted = None
+                    progress_callback(f"Row {row['row_number']}: speed-up unavailable ({exc}).")
+                if fitted:
+                    clip, speed = fitted
+                    length_ms = audio_duration_ms(clip)
+                    progress_callback(
+                        f"OVERLAP FIXED — Row {row['row_number']} sped up {speed:.2f}x "
+                        f"to end before the next line (pitch preserved)."
+                    )
+                else:
+                    progress_callback(
+                        f"OVERLAP — Row {row['row_number']} would need "
+                        + (f"{needed:.2f}x" if needed != float("inf") else "an unlimited speed-up")
+                        + f" (limit below {MAX_FIX_SPEED:.1f}x): kept at normal speed; "
+                        "the next line is placed after it."
+                    )
 
-    unchanged.reason = "Audio still overlaps after bounded speed adjustments."
-    return unchanged
+        clips.append(clip)
+        starts.append(start_ms)
+        previous_end_ms = start_ms + length_ms
+    return clips, starts

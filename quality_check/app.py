@@ -37,6 +37,7 @@ from flask import Flask, abort, jsonify, render_template, request, send_file
 
 from v2.audio_speed import MAX_FIT_SPEED, MIN_FIT_SPEED, check_ffmpeg, validate_speed
 from v2.excel_parser import SUPPORTED_FPS, parse_excel
+from v2.exporter import episode_tag
 from v2.tts_client import ElevenLabsClient
 
 from .dubbing import (DubCancelled, DubError, assemble, clip_lengths, dub_episode, import_clips, regenerate_line,
@@ -268,7 +269,7 @@ def create_app(config=None):
     # ------------------------------------------------------------------ line speeds
     def take_info(record, key):
         """Speeds of a line's take (sessions from before pass 2: a take at 1.00x that fits)."""
-        return (record.get("takes") or {}).get(key) or {"take_speed": 1.0, "fit_speed": 1.0, "needed_speed": 1.0}
+        return (record.get("takes") or {}).get(key) or {"fit_speed": 1.0, "needed_speed": 1.0}
 
     def line_speed_of(record, key):
         """The speed the line plays at: the reviewer's choice, else pass 2's fit."""
@@ -447,15 +448,13 @@ def create_app(config=None):
             folder.mkdir(parents=True)
             try:
                 run.save_script(folder / "script.xlsx")
-                try:
-                    takes = import_clips(folder, rows, run.fps, clips, fits)
-                except DubError as exc:
-                    raise UploadError(str(exc)) from None
+                takes = import_clips(folder, rows, clips, fits)
                 name = details.get("download_name") or details.get("name") or V2_OUTPUT
                 record = {"session_id": session_id, "status": "dubbing", "created": time.time(), "source": "v2",
                           "run": {"id": run_id, "name": name}, "episode": episode,
                           "fps": run.fps, "sheet": run.sheet,
-                          "script": {"name": f"{Path(name).stem}_EP{episode}.xlsx", "size": human_size(len(run.script))},
+                          "script": {"name": f"{Path(name).stem}_{episode_tag(episode)}.xlsx",
+                                     "size": human_size(len(run.script))},
                           "summary": summary, "audio": None, "video": None, "error": None, "failed_row": None,
                           "takes": {str(row): info for row, info in takes.items()}, "edits": {}, "line_speeds": {}}
                 save_record(record)
@@ -533,7 +532,7 @@ def create_app(config=None):
             take = take_info(record, key)
             try:
                 audio, changed, moved = set_line_speed(runtime / session_id, rows, summary, record["fps"],
-                                                       row_number, speed, take["take_speed"], record["audio"])
+                                                       row_number, speed, record["audio"])
             except RuntimeError as exc:  # FFmpeg missing or failed
                 raise UploadError(str(exc), 503) from None
             speeds = dict(record.get("line_speeds") or {})

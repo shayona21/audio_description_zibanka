@@ -32,6 +32,15 @@ def adjust_audio_speed(wav_bytes, speed=1.0):
     speed = check_speed_support(speed)
     if speed == 1.0:
         return wav_bytes
+    return apply_tempo(wav_bytes, speed)
+
+
+def apply_tempo(wav_bytes, speed):
+    """Speed a WAV up by ``speed`` with FFmpeg's atempo, pitch preserved.
+
+    No range check here: the speed dial (above) and the overlap fix
+    (audio_overlap.py) each check their own limits first.
+    """
     try:
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",

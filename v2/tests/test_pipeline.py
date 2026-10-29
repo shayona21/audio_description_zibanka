@@ -15,10 +15,9 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from v2.app import create_app
-from v2.audio_speed import (FIT_TOLERANCE_MS, MAX_FIT_SPEED, MIN_FIT_SPEED, change_speed, fit_speed, needed_speed,
-                            retime, speech_span)
+from v2.audio_speed import FIT_TOLERANCE_MS, MAX_FIT_SPEED, MIN_FIT_SPEED, change_speed, fit_speed, needed_speed, speech_span
 from v2.excel_parser import TEMPLATE_HEADERS, WorkbookValidationError, parse_excel, timecode_to_ms
-from v2.exporter import format_tcr, track_names, timeline_names
+from v2.exporter import format_tcr, line_name, track_names, timeline_names
 from v2.models import DialogueRow
 from v2.pipeline import run_pipeline
 from v2.timing import place_dialogue
@@ -133,13 +132,14 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(summary["tracks"], 3)
         self.assertEqual(summary["flagged_rows"], 1)
         with zipfile.ZipFile(output) as archive:
-            self.assertEqual(set(archive.namelist()), {
-                "tracks/Episode_001_Alice.wav", "tracks/Episode_001_Bob.wav", "tracks/Episode_002_Alice.wav",
-                "lines/001_Alice_2.wav", "lines/001_Bob_3.wav", "lines/001_Alice_4.wav", "lines/002_Alice_5.wav",
-                "Episode_001_timeline.csv", "Episode_002_timeline.csv", "processing_report.csv", "script.xlsx"})
+            audio = {"tracks/ep001_alice.wav", "tracks/ep001_bob.wav", "tracks/ep002_alice.wav",
+                     "lines/ep001_alice_row2.wav", "lines/ep001_bob_row3.wav", "lines/ep001_alice_row4.wav",
+                     "lines/ep002_alice_row5.wav"}
+            self.assertEqual(set(archive.namelist()), {f"{p}/{name}" for p in ("pass1", "pass2") for name in audio} | {
+                "ep001_timeline.csv", "ep002_timeline.csv", "processing_report.csv", "script.xlsx"})
             self.assertEqual(archive.read("script.xlsx"), path.read_bytes())
-            for name in ("Episode_001_Alice.wav", "Episode_001_Bob.wav"):
-                with wave.open(io.BytesIO(archive.read(f"tracks/{name}"))) as wav:
+            for name in ("ep001_alice.wav", "ep001_bob.wav"):
+                with wave.open(io.BytesIO(archive.read(f"pass2/tracks/{name}"))) as wav:
                     self.assertEqual(wav.getnframes(), 3400 * 24)
                     self.assertEqual(wav.getframerate(), 24000)
                     self.assertEqual(wav.getnchannels(), 1)
@@ -147,12 +147,12 @@ class PipelineTests(unittest.TestCase):
                     first_start = 1000
                     self.assertEqual(pcm[:first_start * 24 * 2], bytes(first_start * 24 * 2))
                     self.assertEqual(struct.unpack_from("<h", pcm, first_start * 24 * 2)[0], 1000)
-                    if "Alice" in name:
+                    if "alice" in name:
                         self.assertEqual(struct.unpack_from("<h", pcm, 3300 * 24 * 2)[0], 1000)
-            with wave.open(io.BytesIO(archive.read("tracks/Episode_002_Alice.wav"))) as wav:
+            with wave.open(io.BytesIO(archive.read("pass2/tracks/ep002_alice.wav"))) as wav:
                 self.assertEqual(wav.getnframes(), 1000 * 24)
             report = list(csv.DictReader(io.StringIO(archive.read("processing_report.csv").decode("utf-8-sig"))))
-            self.assertEqual(report[0]["overrun_amnt_ms"], "240")
+            self.assertEqual(report[0]["pass2_overrun_ms"], "240")
             self.assertEqual(report[1]["status"], "OK")
 
     def test_same_character_collision_uses_actual_end_not_script_end(self):
@@ -165,7 +165,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(rows[1]["status"], "OK")
         self.assertEqual(rows[1]["adjusted_start_TCR"], "00:00:01:10")
         self.assertEqual(rows[1]["start_TCR"], "00:00:01:04")
-        self.assertEqual(rows[1]["overrun_amnt_ms"], "0")
+        self.assertEqual(rows[1]["pass2_overrun_ms"], "0")
 
     def test_character_local_delays_match_audio_and_combined_script_exports(self):
         # Unsorted characters and episodes still have independent schedules.
@@ -184,15 +184,15 @@ class PipelineTests(unittest.TestCase):
                      fit_lines=False)
         self.assertEqual(synthesize.call_count, 4)
         expected = {
-            "Episode_001_A": [(0, 45000, "Walk?", 0), (45000, 47000, "Why?", 5000)],
-            "Episode_001_B": [(11000, 14000, "[laughs]", 0)],
-            "Episode_002_A": [(1000, 2000, "Other episode", 0)],
+            "ep001_a": [(0, 45000, "Walk?", 0), (45000, 47000, "Why?", 5000)],
+            "ep001_b": [(11000, 14000, "[laughs]", 0)],
+            "ep002_a": [(1000, 2000, "Other episode", 0)],
         }
         with zipfile.ZipFile(output) as archive:
             for stem, expected_rows in expected.items():
                 with self.subTest(track=stem):
-                    with wave.open(io.BytesIO(archive.read(f"tracks/{stem}.wav"))) as audio:
-                        duration = 47000 if stem.startswith("Episode_001") else 2000
+                    with wave.open(io.BytesIO(archive.read(f"pass2/tracks/{stem}.wav"))) as audio:
+                        duration = 47000 if stem.startswith("ep001") else 2000
                         self.assertEqual(audio.getnframes(), duration * 24)
                         actual = audio.readframes(audio.getnframes())
                     expected_pcm = bytearray(duration * 24 * 2)
@@ -200,7 +200,7 @@ class PipelineTests(unittest.TestCase):
                         expected_pcm[start * 24 * 2:end * 24 * 2] = struct.pack("<h", values[text]) * ((end - start) * 24)
                     self.assertEqual(actual, bytes(expected_pcm))
             timeline = list(csv.reader(io.StringIO(
-                archive.read("Episode_001_timeline.csv").decode("utf-8-sig")
+                archive.read("ep001_timeline.csv").decode("utf-8-sig")
             )))
             self.assertEqual(timeline, [
                 ["Dialogue", "Original time start", "Original time end",
@@ -210,7 +210,7 @@ class PipelineTests(unittest.TestCase):
                 ["A: Why?", "00:00:40.000", "00:00:42.000", "00:00:45.000", "00:00:47.000", "5.000 s"],
             ])
             other = list(csv.DictReader(io.StringIO(
-                archive.read("Episode_002_timeline.csv").decode("utf-8-sig")
+                archive.read("ep002_timeline.csv").decode("utf-8-sig")
             )))
             self.assertEqual(len(other), 1)
             self.assertEqual(other[0]["Dialogue"], "A: Other episode")
@@ -221,7 +221,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(report[0]["start_TCR"], "00:00:40:00")
             self.assertEqual(report[0]["adjusted_start_TCR"], "00:00:45:00")
             self.assertEqual(report[0]["duration"], "2000")
-            self.assertEqual(report[0]["overrun_amnt_ms"], "0")
+            self.assertEqual(report[0]["pass2_overrun_ms"], "0")
 
     def test_available_silence_absorbs_delays_within_each_character(self):
         path = self.workbook([
@@ -243,13 +243,13 @@ class PipelineTests(unittest.TestCase):
                              ["00:00:00:00", "00:00:15:00", "00:00:20:00", "00:00:12:00", "00:00:26:00"])
             self.assertEqual([r["adjusted_end_TCR"] for r in records],
                              ["00:00:15:00", "00:00:16:00", "00:00:26:00", "00:00:12:13", "00:00:26:13"])
-            self.assertEqual([int(r["overrun_amnt_ms"]) for r in records], [5000, 0, 4000, 0, 0])
-            timeline = list(csv.DictReader(io.StringIO(archive.read("Episode_001_timeline.csv").decode("utf-8-sig"))))
+            self.assertEqual([int(r["pass2_overrun_ms"]) for r in records], [5000, 0, 4000, 0, 0])
+            timeline = list(csv.DictReader(io.StringIO(archive.read("ep001_timeline.csv").decode("utf-8-sig"))))
             self.assertEqual([r["Dialogue"] for r in timeline],
                              ["Alice: first", "Bob: bob", "Alice: short", "Alice: long", "Alice: last"])
             self.assertEqual([r["Delay"] for r in timeline], ["0.000 s", "0.000 s", "4.000 s", "0.000 s", "1.000 s"])
-            for name in ("Episode_001_Alice.wav", "Episode_001_Bob.wav"):
-                with wave.open(io.BytesIO(archive.read(f"tracks/{name}"))) as audio:
+            for name in ("ep001_alice.wav", "ep001_bob.wav"):
+                with wave.open(io.BytesIO(archive.read(f"pass2/tracks/{name}"))) as audio:
                     self.assertEqual(audio.getnframes(), 27000 * 24)
 
     def test_timeline_preserves_millisecond_precision_and_csv_dialogue(self):
@@ -263,7 +263,7 @@ class PipelineTests(unittest.TestCase):
                      fit_lines=False)
         with zipfile.ZipFile(output) as archive:
             records = list(csv.DictReader(io.StringIO(
-                archive.read("Episode_001_timeline.csv").decode("utf-8-sig")
+                archive.read("ep001_timeline.csv").decode("utf-8-sig")
             )))
         self.assertEqual(records[0]["Adjusted time start"], "00:00:00.042")
         self.assertEqual(records[0]["Adjusted time end"], "00:00:01.543")
@@ -304,9 +304,9 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(all("/" not in name and "\\" not in name for name in names.values()))
 
     def test_report_exact_schema_and_frame_rate_calculations(self):
-        headers = ["excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR",
-                   "duration", "actual_duration_ms", "overrun_amnt_ms", "status", "track",
-                   "adjusted_start_TCR", "adjusted_end_TCR", "fit_speed"]
+        headers = ["excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "duration",
+                   "pass1_duration_ms", "pass1_overrun_ms", "fit_speed", "pass2_duration_ms", "pass2_overrun_ms",
+                   "status", "track", "adjusted_start_TCR", "adjusted_end_TCR"]
         expected_ends = {24: "00:00:01:05", 25: "00:00:01:05", 30: "00:00:01:06",
                          50: "00:00:01:10", 60: "00:00:01:11"}
         path = self.workbook([dialogue(start="00:00:00:01", end="00:00:01:01")])
@@ -319,10 +319,10 @@ class PipelineTests(unittest.TestCase):
                     records = list(csv.reader(io.StringIO(archive.read("processing_report.csv").decode("utf-8-sig"))))
                     self.assertEqual(records, [headers, [
                         "2", "001", "Alice", "alice-voice", "00:00:00:01", "00:00:01:01",
-                        "1000", "1173", "173", "TCR_OUT_OVERRUN", "Episode_001_Alice.wav",
-                        "00:00:00:01", end, "1.00",
+                        "1000", "1173", "173", "1.00", "1173", "173", "TCR_OUT_OVERRUN", "ep001_alice.wav",
+                        "00:00:00:01", end,
                     ]])
-                    with wave.open(io.BytesIO(archive.read("tracks/Episode_001_Alice.wav"))) as audio:
+                    with wave.open(io.BytesIO(archive.read("pass2/tracks/ep001_alice.wav"))) as audio:
                         exact_end = timecode_to_ms("00:00:00:01", fps) + 1173
                         self.assertEqual(audio.getnframes(), exact_end * 24)
                         self.assertAlmostEqual(timecode_to_ms(end, fps), exact_end, delta=500 / fps + 0.5)
@@ -386,9 +386,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('filename="English dialogue.zip"', response.headers["Content-Disposition"])
         with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
-            self.assertIn("tracks/Episode_001_Alice.wav", archive.namelist())
-            self.assertIn("lines/001_Alice_2.wav", archive.namelist())
-            self.assertIn("Episode_001_timeline.csv", archive.namelist())
+            self.assertIn("pass2/tracks/ep001_alice.wav", archive.namelist())
+            self.assertIn("pass2/lines/ep001_alice_row2.wav", archive.namelist())
+            self.assertIn("ep001_timeline.csv", archive.namelist())
             self.assertIn("script.xlsx", archive.namelist())
         response.close()
         # run.json lets the Dubbing Quality Check list and import finished runs.
@@ -426,6 +426,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(fit_speed(self.spoken_clip(4000), 1000), MAX_FIT_SPEED)    # held at 1.5x
         self.assertEqual(fit_speed(self.spoken_clip(200), 1000), MIN_FIT_SPEED)     # held at 0.7x
         self.assertEqual(fit_speed(wav_bytes(500, value=0), 1000), 1.0)             # silence: left alone
+        self.assertAlmostEqual(needed_speed(self.spoken_clip(4000), 1000), 4.0, places=2)  # unlimited
         clip = self.spoken_clip(500)
         with patch("v2.audio_speed.shutil.which", return_value=None):
             self.assertIs(change_speed(clip, 1.0), clip)                            # 1.00x needs no FFmpeg
@@ -434,19 +435,6 @@ class PipelineTests(unittest.TestCase):
         for bad in ("", "bad", "nan", 0.69, 1.51):
             with self.assertRaises(ValueError):
                 change_speed(clip, bad)
-
-    def test_needed_speed_and_retime_beyond_one_atempo_stage(self):
-        # Unlimited speed needed (Quality Check's suggestion), also for a clip already sped up.
-        self.assertAlmostEqual(needed_speed(self.spoken_clip(4000), 1000), 4.0, places=2)
-        self.assertAlmostEqual(needed_speed(self.spoken_clip(1000), 2000, clip_speed=1.5), 0.75, places=2)
-        # Quality Check takes a 1.50x clip to 0.70x: a ratio below FFmpeg's 0.5 per atempo stage.
-        clip = self.spoken_clip(1000, lead_ms=0, tail_ms=0)
-        for ratio in (0.7 / 1.5, 1.5 / 0.7):
-            slowed = AudioSegment.from_wav(io.BytesIO(retime(clip, ratio)))
-            self.assertAlmostEqual(len(slowed), 1000 / ratio, delta=40)
-        self.assertIs(retime(clip, 1.0), clip)
-        with self.assertRaises(ValueError):
-            retime(clip, 0)
 
     def test_pipeline_fits_lines_and_outputs_tracks_and_lines(self):
         path = self.workbook([
@@ -462,29 +450,49 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(summary["fitted_rows"], 3)
         with zipfile.ZipFile(output) as archive:
             names = set(archive.namelist())
-            lines = sorted(n for n in names if n.startswith("lines/"))
-            self.assertEqual(lines, ["lines/001_Alice_2.wav", "lines/001_Alice_3.wav", "lines/001_Alice_4.wav",
-                                     "lines/001_Bob_5.wav"])              # one per dubbed row
-            self.assertEqual(sorted(n for n in names if n.startswith("tracks/")),
-                             ["tracks/Episode_001_Alice.wav", "tracks/Episode_001_Bob.wav"])
+            lines = sorted(n for n in names if n.startswith("pass2/lines/"))
+            self.assertEqual(lines, ["pass2/lines/ep001_alice_row2.wav", "pass2/lines/ep001_alice_row3.wav", "pass2/lines/ep001_alice_row4.wav",
+                                     "pass2/lines/ep001_bob_row5.wav"])              # one per dubbed row
+            self.assertEqual(sorted(n for n in names if n.startswith("pass2/tracks/")),
+                             ["pass2/tracks/ep001_alice.wav", "pass2/tracks/ep001_bob.wav"])
             report = {int(r["excel_row"]): r for r in csv.DictReader(io.StringIO(
                 archive.read("processing_report.csv").decode("utf-8-sig")))}
             self.assertEqual({row: r["fit_speed"] for row, r in report.items()},
                              {2: "1.30", 3: "0.80", 4: "1.00", 5: "1.50"})
             # Fitted lines now speak for (about) their slot; the held line is as fast as allowed.
             for row, slot in ((2, 2000), (3, 1000)):
-                start, end, _ = speech_span(archive.read(f"lines/001_Alice_{row}.wav"))
+                start, end, _ = speech_span(archive.read(f"pass2/lines/ep001_alice_row{row}.wav"))
                 self.assertAlmostEqual(end - start, slot, delta=40)
-            start, end, _ = speech_span(archive.read("lines/001_Bob_5.wav"))
+            start, end, _ = speech_span(archive.read("pass2/lines/ep001_bob_row5.wav"))
             self.assertAlmostEqual(end - start, 4000 / 1.5, delta=40)
             # A line within the tolerance is the ElevenLabs take, untouched.
-            self.assertEqual(archive.read("lines/001_Alice_4.wav"), self.spoken_clip(1050))
+            self.assertEqual(archive.read("pass2/lines/ep001_alice_row4.wav"), self.spoken_clip(1050))
             # Tracks are built from exactly the clips in lines/, at their placements.
-            alice = AudioSegment.from_wav(io.BytesIO(archive.read("tracks/Episode_001_Alice.wav")))
-            line = AudioSegment.from_wav(io.BytesIO(archive.read("lines/001_Alice_3.wav")))
+            alice = AudioSegment.from_wav(io.BytesIO(archive.read("pass2/tracks/ep001_alice.wav")))
+            line = AudioSegment.from_wav(io.BytesIO(archive.read("pass2/lines/ep001_alice_row3.wav")))
             start_ms = timecode_to_ms(report[3]["adjusted_start_TCR"])
             self.assertEqual(alice[start_ms:start_ms + len(line)].raw_data, line.raw_data)
-            self.assertEqual(int(report[3]["actual_duration_ms"]), len(line))
+            self.assertEqual(int(report[3]["pass2_duration_ms"]), len(line))
+            # Pass 1 is ElevenLabs as delivered, with its own tracks placed by the same rule.
+            for row, text in ((2, "long"), (3, "short"), (4, "fits")):
+                self.assertEqual(archive.read(f"pass1/lines/ep001_alice_row{row}.wav"), self.spoken_clip(speech[text]))
+            self.assertEqual(archive.read("pass1/lines/ep001_bob_row5.wav"), self.spoken_clip(4000))
+            self.assertEqual((int(report[2]["pass1_duration_ms"]), int(report[2]["pass1_overrun_ms"])), (2950, 950))
+            self.assertEqual(int(report[3]["pass1_overrun_ms"]), 150)   # 1.15 s clip (with silence) in 1.0 s
+            pass1 = AudioSegment.from_wav(io.BytesIO(archive.read("pass1/tracks/ep001_alice.wav")))
+            first = AudioSegment.from_wav(io.BytesIO(archive.read("pass1/lines/ep001_alice_row2.wav")))
+            self.assertEqual(pass1[:len(first)].raw_data, first.raw_data)
+            # Each pass's tracks end at that pass's last audio (row 4's longer pass 1 take).
+            self.assertEqual(len(pass1), 5000 + 1050 + 150 + 200)   # row 4 at 5.0 s: lead, speech, tail
+
+    def test_file_names_are_lowercase_with_an_episode_prefix(self):
+        row = DialogueRow(12, "EP01", "ONSCREEN TEXT", 0, 1000, "Hi", "v")
+        self.assertEqual(line_name(row), "ep01_onscreen_text_row12.wav")
+        self.assertEqual(line_name(DialogueRow(3, "1", "Kuhu", 0, 1000, "Hi", "v")), "ep1_kuhu_row3.wav")
+        self.assertEqual(track_names({("1", "KUHU"), ("1", "Kuhu"), ("EP 2", "Guard 1(M)")}),
+                         {("1", "KUHU"): "ep1_kuhu.wav", ("1", "Kuhu"): "ep1_kuhu_2.wav",
+                          ("EP 2", "Guard 1(M)"): "ep2_guard_1(m).wav"})
+        self.assertEqual(timeline_names({"1"}), {"1": "ep1_timeline.csv"})
 
     def test_missing_ffmpeg_is_refused_before_any_generation(self):
         synthesize = Mock()

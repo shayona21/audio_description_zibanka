@@ -8,7 +8,6 @@ import os
 import tempfile
 import unittest
 import wave
-import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -75,9 +74,9 @@ class LanguageTests(unittest.TestCase):
     def test_default_and_selected_language_reach_worker_and_status(self):
         with patch.object(web.threading, "Thread") as thread:
             for selected, expected in ((None, "Hindi"), (" French ", "French")):
-                response = self.upload(selected, output_name="track.zip")
+                response = self.upload(selected, output_name="track.wav")
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json["download_name"], "track.zip")
+                self.assertEqual(response.json["download_name"], "track.wav")
                 job_id = response.json["job_id"]
                 self.assertEqual(self.client.get(f"/status/{job_id}").json["language"], expected)
                 self.assertEqual(thread.call_args.kwargs["kwargs"]["language"], expected)
@@ -93,7 +92,6 @@ class LanguageTests(unittest.TestCase):
         self.assertEqual(thread.call_args.kwargs["kwargs"], {
             "language": "Albanian",
             "provider": "google",
-            "output_mode": "split",
         })
 
     def test_google_provider_requires_its_own_api_key_before_job_creation(self):
@@ -136,7 +134,7 @@ class LanguageTests(unittest.TestCase):
         alternate_request = self.urlopen.call_args.args[0]
         self.assertEqual(alternate_request.get_header("X-goog-api-key"), "gemini-only-key")
 
-    def test_google_upload_runs_through_segment_zip_download(self):
+    def test_google_upload_runs_through_wav_download(self):
         self.response.read.return_value = json.dumps({
             "steps": [{"content": [{
                 "type": "audio",
@@ -163,11 +161,11 @@ class LanguageTests(unittest.TestCase):
         self.assertEqual(status["status"], "done", status.get("error"))
         self.assertEqual(status["provider"], "google")
         download = self.client.get(f"/download/{job_id}")
-        with zipfile.ZipFile(io.BytesIO(download.data)) as archive:
-            self.assertEqual(archive.namelist(), ["Row_1_1.wav"])
-            with wave.open(io.BytesIO(archive.read("Row_1_1.wav"))) as audio:
-                self.assertEqual(audio.getframerate(), 24000)
-                self.assertEqual(audio.getnframes(), 2400)
+        with wave.open(io.BytesIO(download.data)) as audio:
+            self.assertEqual(audio.getframerate(), 24000)
+            self.assertEqual(audio.getnframes(), (2000 + 5000) * 24)  # last end timecode + 5 s
+            audio.setpos(1000 * 24)                                     # line at its start timecode
+            self.assertEqual(audio.readframes(2400), self.pcm)
         download.close()
 
     def test_tts_defaults_and_request_language_are_independent(self):
@@ -234,17 +232,16 @@ class LanguageTests(unittest.TestCase):
                     self.assertEqual(payload["language_code"], tts.LANGUAGE_CODES[language])
                 download = self.client.get(f"/download/{job_id}")
                 self.assertEqual(download.status_code, 200)
-                self.assertIn("track.zip", download.headers["Content-Disposition"])
-                with zipfile.ZipFile(io.BytesIO(download.data)) as archive:
-                    self.assertEqual(archive.namelist(), ["Row_1_2.wav"])
-                    with wave.open(io.BytesIO(archive.read("Row_1_2.wav"))) as audio:
-                        self.assertEqual((audio.getframerate(), audio.getnchannels(), audio.getsampwidth()), (24000, 1, 2))
-                        self.assertEqual(audio.getnframes(), 1100 * 24)
-                        self.assertEqual(audio.readframes(2400), self.pcm)
+                self.assertIn("track.wav", download.headers["Content-Disposition"])
+                with wave.open(io.BytesIO(download.data)) as audio:
+                    self.assertEqual((audio.getframerate(), audio.getnchannels(), audio.getsampwidth()), (24000, 1, 2))
+                    self.assertEqual(audio.getnframes(), (3000 + 5000) * 24)
+                    audio.setpos(1000 * 24)
+                    self.assertEqual(audio.readframes(2400), self.pcm)
                 download.close()
 
     def test_programmatic_runner_passes_language(self):
-        rows = [dict(text="Une porte s’ouvre.", row_number=1, end_ms=1000)]
+        rows = [dict(text="Une porte s’ouvre.", row_number=1, start_ms=0, end_ms=1000)]
         with patch.object(main, "parse_file", return_value=rows), \
              patch.object(main, "build_master_timeline"), \
              patch.object(main, "export_wav"), patch.object(main.time, "sleep"):
@@ -261,7 +258,8 @@ class LanguageTests(unittest.TestCase):
         self.assertIn('id="provider-select" name="provider"', html)
         self.assertIn('id="google-voice-select" name="google_voice"', html)
         self.assertIn('id="elevenlabs-voice-id" name="elevenlabs_voice"', html)
-        self.assertIn("Download ZIP", html)
+        self.assertIn("Download WAV", html)
+        self.assertNotIn("output_mode", html)
         self.assertIn('<option value="Hindi" selected>Hindi</option>', html)
         for language in tts.AVAILABLE_LANGUAGES:
             self.assertIn(f'value="{language}"', html)

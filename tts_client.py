@@ -65,7 +65,7 @@ GOOGLE_VOICES = [
     "Rasalgethi", "Sadachbia", "Sadaltager", "Schedar", "Sulafat",
     "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi", "Achernar",
 ]
-MODEL_ID = "eleven_v4"
+MODEL_ID = "eleven_v3"  # AD narration needs no emotion tags
 GOOGLE_MODEL_ID = "gemini-3.8-flash-lite-tts"
 SAMPLE_RATE = 24000
 

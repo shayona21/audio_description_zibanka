@@ -43,39 +43,15 @@ def validate_speed(value):
 
 
 def change_speed(wav_bytes, speed):
-    """Return the clip at ``speed`` (MIN_FIT_SPEED..MAX_FIT_SPEED) with unchanged pitch; 1.00x
-    returns the input unchanged."""
-    return retime(wav_bytes, validate_speed(speed))
-
-
-def _atempo_chain(ratio):
-    """``atempo`` filters for any ratio; each stage stays within FFmpeg's 0.5..2.0 per filter."""
-    stages = []
-    while ratio > 2.0:
-        stages.append(2.0)
-        ratio /= 2.0
-    while ratio < 0.5:
-        stages.append(0.5)
-        ratio /= 0.5
-    stages.append(ratio)
-    return ",".join(f"atempo={stage:.6f}" for stage in stages)
-
-
-def retime(wav_bytes, ratio):
-    """Play the clip ``ratio`` times faster, pitch preserved; 1.0 returns the input unchanged.
-
-    No range check: callers decide the limits. The Dubbing Quality Check uses it to take a clip that
-    is already at one speed to another (ratio = new speed / current speed).
-    """
-    if not math.isfinite(ratio) or ratio <= 0:
-        raise ValueError("Speed ratio must be a positive number")
-    if abs(ratio - 1.0) < 1e-9:
+    """Return the clip at ``speed`` with unchanged pitch; 1.00x returns the input unchanged."""
+    speed = validate_speed(speed)
+    if speed == 1.0:
         return wav_bytes
     check_ffmpeg()
     try:
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
-             "-i", "pipe:0", "-af", _atempo_chain(ratio),
+             "-i", "pipe:0", "-af", f"atempo={speed}",
              "-ar", "24000", "-ac", "1", "-c:a", "pcm_s16le",
              "-f", "wav", "pipe:1"],
             input=wav_bytes, capture_output=True, check=True, timeout=120,
@@ -111,14 +87,11 @@ def speech_span(wav_bytes):
     return voiced[0] * SPEECH_WINDOW_MS, min(clip_ms, (voiced[-1] + 1) * SPEECH_WINDOW_MS), clip_ms
 
 
-def needed_speed(wav_bytes, slot_ms, clip_speed=1.0):
-    """The speed (relative to the natural take) at which the spoken part lasts ``slot_ms``, with no
-    limits or rounding; 1.0 when the line is already within the tolerance (or silent).
-
-    ``clip_speed`` is the speed the clip is already at (1.0 for an ElevenLabs take as delivered).
-    """
+def needed_speed(wav_bytes, slot_ms):
+    """The speed at which the spoken part lasts ``slot_ms``, with no limits or rounding; 1.0 when the
+    line is already within the tolerance (or silent). Quality Check shows it when a limit is reached."""
     start, end, _clip = speech_span(wav_bytes)
-    spoken = (end - start) * clip_speed
+    spoken = end - start
     if spoken <= 0 or slot_ms <= 0 or abs(slot_ms - spoken) <= FIT_TOLERANCE_MS:
         return 1.0
     return spoken / slot_ms

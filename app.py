@@ -1,13 +1,11 @@
 # app.py
 # Flask web UI for the Audio Description tool
-# Upload CSV/Excel → split WAV segments in a ZIP or a full WAV track
+# Upload CSV/Excel → one full WAV track (overlaps fixed, see audio_overlap.py)
 
 import os
 import re
 import uuid
 import threading
-import io
-import zipfile
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_file
 from dotenv import load_dotenv
@@ -19,11 +17,9 @@ from tts_client import (
     validate_language, validate_provider,
     validate_provider_api_key, validate_voice,
 )
-from audio_builder import (
-    audio_duration_ms, build_master_timeline, build_segment_timeline, export_wav_bytes,
-)
+from audio_builder import build_master_timeline, export_wav_bytes
+from audio_overlap import fix_overlaps
 from audio_speed import adjust_audio_speed, check_speed_support
-from audio_overlap import repair_overlap
 import audio_speed
 
 load_dotenv()
@@ -40,12 +36,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # ── Job state tracker ─────────────────────────────────────────────────────────
 # Stores progress for each running job so the browser can poll it
 jobs = {}
-
-
-def validate_output_mode(value):
-    if value not in ("split", "full"):
-        raise ValueError("Choose split WAV segments or a full WAV track")
-    return value
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -79,7 +69,6 @@ def upload():
     file = request.files["file"]
     requested_name = request.form.get("output_name", "").strip()
     try:
-        output_mode = validate_output_mode(request.form.get("output_mode", "split"))
         selected_provider = validate_provider(
             request.form.get("provider", DEFAULT_PROVIDER).strip()
         )
@@ -113,8 +102,7 @@ def upload():
     if not output_stem:
         return jsonify({"error": "Please enter an output file name"}), 400
 
-    extension = "zip" if output_mode == "split" else "wav"
-    download_name = f"{output_stem}.{extension}"
+    download_name = f"{output_stem}.wav"
 
     # Save the uploaded file with a unique name
     job_id   = uuid.uuid4().hex[:8]
@@ -129,7 +117,6 @@ def upload():
         "current":  0,
         "output":   None,
         "download_name": download_name,
-        "output_mode": output_mode,
         "provider": selected_provider,
         "voice": selected_voice,
         "language": selected_language,
@@ -141,10 +128,7 @@ def upload():
     thread = threading.Thread(
         target=process_job,
         args=(job_id, str(upload_path), selected_voice, speed),
-        kwargs={
-            "language": selected_language, "provider": selected_provider,
-            "output_mode": output_mode,
-        },
+        kwargs={"language": selected_language, "provider": selected_provider},
         daemon=True
     )
     thread.start()
@@ -168,7 +152,7 @@ def status(job_id):
 @app.route("/download/<job_id>")
 def download(job_id):
     """
-    Download the finished WAV track or ZIP of WAV segments.
+    Download the finished WAV track.
     """
 
     if job_id not in jobs:
@@ -183,16 +167,14 @@ def download(job_id):
         output_path,
         as_attachment=True,
         download_name=jobs[job_id]["download_name"],
-        mimetype=("audio/wav" if jobs[job_id].get("output_mode") == "full"
-                  else "application/zip"),
+        mimetype="audio/wav",
     )
 
 
 # ── Background processing ─────────────────────────────────────────────────────
 
 def process_job(job_id, upload_path, voice=None, speed=1.0,
-                language=DEFAULT_LANGUAGE, provider=DEFAULT_PROVIDER,
-                output_mode="split"):
+                language=DEFAULT_LANGUAGE, provider=DEFAULT_PROVIDER):
     """
     Full pipeline: parse CSV/Excel → TTS → build timeline → export .wav
     Runs in a background thread. Updates jobs[job_id] as it goes.
@@ -203,14 +185,6 @@ def process_job(job_id, upload_path, voice=None, speed=1.0,
         log(job_id, message)
 
     try:
-        output_mode = validate_output_mode(output_mode)
-        jobs[job_id]["output_mode"] = output_mode
-        jobs[job_id]["repaired_rows"] = []
-        jobs[job_id]["flagged_rows"] = []
-        log(job_id, "Output: " + (
-            "split WAV segments (ZIP)" if output_mode == "split"
-            else "full WAV track (overlaps preserved)"
-        ))
         provider = validate_provider(provider)
         voice = validate_voice(voice, provider)
         language = validate_language(language, provider)
@@ -223,23 +197,15 @@ def process_job(job_id, upload_path, voice=None, speed=1.0,
         file_type = detect_file_type(upload_path)
         log(job_id, f"Parsing {file_type.upper()} file...")
         rows = parse_file(upload_path, progress_callback=report)
+        # The client's file is used as given; only the order is sorted here, by
+        # start timecode (rows with the same start keep their order in the file).
+        rows = sorted(rows, key=lambda row: row["start_ms"])
         jobs[job_id]["total"] = len(rows)
         log(job_id, f"Found {len(rows)} AD rows.")
 
         # Step 2: Convert each row to speech
         log(job_id, f"Converting rows to speech via {PROVIDERS[provider]} (voice: {voice})...")
-        segments = []
-        segment_rows = []
-        segment_clips = []
-        latest_clip_end_ms = 0
-
-        def close_segment():
-            nonlocal segment_rows, segment_clips
-            if segment_rows:
-                segments.append((segment_rows, segment_clips))
-                segment_rows = []
-                segment_clips = []
-
+        audio_clips = []
         for i, row in enumerate(rows):
             jobs[job_id]["current"] = i + 1
             log(job_id, f"Row {i + 1}/{len(rows)}: {row['text'][:50]}...")
@@ -247,99 +213,26 @@ def process_job(job_id, upload_path, voice=None, speed=1.0,
             pcm_bytes = text_to_speech(
                 row["text"], voice=voice, language=language, provider=provider
             )
-
-            # Measure the actual output after applying the selected speed.
             wav_bytes = pcm_to_wav(pcm_bytes)
-            wav_bytes = adjust_audio_speed(wav_bytes, speed)
-            output_length_ms = audio_duration_ms(wav_bytes)
+            audio_clips.append(adjust_audio_speed(wav_bytes, speed))
 
-            # The available window ends at the next dialogue's start, not
-            # the spreadsheet end time. The final row has no next dialogue.
-            predicted_length_ms = (
-                rows[i + 1]["start_ms"] - row["start_ms"]
-                if i + 1 < len(rows) else None
-            )
-            repair = repair_overlap(wav_bytes, predicted_length_ms)
-            if repair.repaired:
-                jobs[job_id]["repaired_rows"].append(row["row_number"])
-                log(
-                    job_id,
-                    f"OVERLAP REPAIRED — Row {row['row_number']}: "
-                    f"{output_length_ms / 1000:.3f}s → {repair.duration_ms / 1000:.3f}s "
-                    f"at {repair.speed:.4f}x additional speed "
-                    f"({speed * repair.speed:.4f}x total; pitch preserved).",
-                )
-            wav_bytes = repair.audio
-            output_length_ms = repair.duration_ms
-            latest_clip_end_ms = max(
-                latest_clip_end_ms, row["start_ms"] + output_length_ms
-            )
-            duration_overrun = (
-                predicted_length_ms is not None
-                and output_length_ms > predicted_length_ms
-            )
-            if duration_overrun:
-                jobs[job_id]["flagged_rows"].append(row["row_number"])
-                overrun_ms = output_length_ms - predicted_length_ms
-                log(
-                    job_id,
-                    f"OVERLAP DETECTED — DURATION OVERRUN — "
-                    f"Row {row['row_number']} output length is "
-                    f"{output_length_ms / 1000:.2f}s; predicted length "
-                    f"(until Row {rows[i + 1]['row_number']} starts) is "
-                    f"{predicted_length_ms / 1000:.2f}s "
-                    f"(over by {overrun_ms / 1000:.3f}s). "
-                    f"MANUAL FIX REQUIRED — {repair.reason}",
-                )
-
-            segment_rows.append(row)
-            segment_clips.append(wav_bytes)
-
-            if duration_overrun and output_mode == "split":
-                log(job_id, f"Ending this WAV segment at Row {row['row_number']}.")
-                close_segment()
-
-        close_segment()
-
-        if output_mode == "full":
-            # Retain the original timeline from zero, including its end buffer,
-            # and extend it if necessary so no generated speech is cut off.
-            duration_ms = max(rows[-1]["end_ms"] + 5000, latest_clip_end_ms)
-            full_rows, full_clips = segments[0]
-            master = build_master_timeline(
-                full_rows, full_clips, duration_ms, progress_callback=report
-            )
-            log(job_id, "Exporting full WAV track...")
-            output_bytes = export_wav_bytes(master)
-            extension = "wav"
-            completion_message = "Complete! Your full WAV track is ready."
-        else:
-            archive_buffer = io.BytesIO()
-            with zipfile.ZipFile(
-                archive_buffer, "w", compression=zipfile.ZIP_DEFLATED
-            ) as archive:
-                for segment_rows, segment_clips in segments:
-                    first_row = segment_rows[0]["row_number"]
-                    last_row = segment_rows[-1]["row_number"]
-                    wav_name = f"Row_{first_row}_{last_row}.wav"
-                    log(job_id, f"Exporting {wav_name}...")
-                    master = build_segment_timeline(
-                        segment_rows,
-                        segment_clips,
-                        progress_callback=report,
-                    )
-                    archive.writestr(wav_name, export_wav_bytes(master))
-            output_bytes = archive_buffer.getvalue()
-            extension = "zip"
-            completion_message = f"Complete! {len(segments)} WAV file(s) are ready in the ZIP."
-
-        output_path = str(OUTPUT_DIR / f"{job_id}_output.{extension}")
-        Path(output_path).write_bytes(output_bytes)
+        # Step 3: Fix overlaps (speed up below 1.5x, else play after the
+        # previous line), then place the lines on one track from zero. The
+        # track keeps a 5 s buffer after the last end timecode and is extended
+        # if needed so no speech is cut off.
+        audio_clips, starts_ms = fix_overlaps(rows, audio_clips, progress_callback=report)
+        duration_ms = max(row["end_ms"] for row in rows) + 5000
+        master = build_master_timeline(
+            rows, audio_clips, starts_ms, duration_ms, progress_callback=report
+        )
+        log(job_id, "Exporting full WAV track...")
+        output_path = str(OUTPUT_DIR / f"{job_id}_output.wav")
+        Path(output_path).write_bytes(export_wav_bytes(master))
 
         # Mark job as done
         jobs[job_id]["status"] = "done"
         jobs[job_id]["output"] = output_path
-        log(job_id, completion_message)
+        log(job_id, "Complete! Your full WAV track is ready.")
 
     except Exception as e:
         jobs[job_id]["status"] = "error"

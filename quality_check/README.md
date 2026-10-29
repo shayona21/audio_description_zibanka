@@ -70,14 +70,16 @@ here, newest first (30 at most). If AD Tool V2 runs from a different folder than
 `AD_V2_RUNTIME_DIR` to its `v2/runtime` folder. A run made elsewhere can be uploaded as its ZIP instead (kept 24
 hours). After picking the run and the episode:
 
-- The episode's clips are taken from the ZIP's `lines/` folder (`<episode>_<character>_<row>.wav`,
-  the names from `v2.exporter.line_name`) and its rows from the ZIP's `script.xlsx`. Every clip is
+- The episode's clips are taken from the ZIP's `pass1/lines/` and `pass2/lines/` folders
+  (`ep<episode>_<character>_row<row>.wav`, the names from `v2.exporter.line_name`) and its rows from
+  the ZIP's `script.xlsx`. Pass 1 becomes each line's take and pass 2 is what plays. Every clip is
   checked first; a missing one is reported by Excel row before anything is stored.
-- The character tracks are rebuilt from those clips with V2's rule, so they are sample-identical to
-  the tracks in the ZIP (a test checks this) and one line can later be changed on its own.
+- The character tracks are rebuilt from the pass 2 clips with V2's rule, so they are sample-identical
+  to `pass2/tracks/` in the ZIP (a test checks this) and one line can later be changed on its own.
 - Each line's fit speed comes from the ZIP's `processing_report.csv`. An uploaded ZIP's frame rate is
   found by matching the report's scripted durations against the workbook.
-- ZIPs from before AD Tool V2 kept line clips are refused with a message to run the script again.
+- ZIPs from an earlier AD Tool V2 (without `pass1/` and `pass2/` line clips) are refused with a
+  message to run the script again.
 - Editing a line's words still makes one ElevenLabs request for that line, fitted like the rest.
 ## Script panel and subtitles (Block 4)
 
@@ -113,9 +115,8 @@ such as `1.30x`.
 
 Next to Video sound and Dub sound, **Line speed** sets the speed of the line selected in the script,
 from 0.70x to 1.50x (pitch preserved, FFmpeg). Speeds are always relative to ElevenLabs' natural
-delivery and applied to the line's take, so changes never stack: 1.00x is the natural take and the
-fit speed gives the fitted clip back exactly (an imported take is V2's fitted clip, so its speed is
-taken from there). The line keeps its start time; only that character's track is rebuilt and no
+delivery and applied to the line's take (pass 1), so changes never stack: 1.00x is the natural take
+and the fit speed gives the pass 2 clip back exactly. The line keeps its start time; only that character's track is rebuilt and no
 ElevenLabs request is made. A speed set in review shows a blue badge. Regenerating a line gives a
 new take at its own fit speed.
 
@@ -125,14 +126,15 @@ the line fit. It never changes the audio; the reviewer decides whether to use th
 
 ## Export (Block 6)
 
-**Export episode** (top right of the review) downloads `Episode_<ep>_QC.zip`, in AD version 2's layout:
+**Export episode** (top right of the review) downloads `ep<ep>_qc.zip`, with AD version 2's names
+(lowercase, spaces as underscores):
 
 | File | Contents |
 | --- | --- |
-| `Episode_<ep>_<character>.wav` | One per character, exactly as heard in the review (edits and line speeds included) |
-| `Episode_<ep>_timeline.csv` | AD version 2's combined timeline, recomputed for the reviewed audio |
-| `processing_report.csv` | AD version 2's report columns, recomputed for the reviewed audio; `fit_speed` is the speed each line plays at |
-| `<script>_QC.xlsx` | The workbook (uploaded, or the run's `script.xlsx`) with edited lines written into TARGET DIALOGUE. Changed cells are highlighted and carry a note with the script wording (and any speed set in review). Nothing else in the workbook changes. |
+| `ep<ep>_<character>.wav` | One per character, exactly as heard in the review (edits and line speeds included) |
+| `ep<ep>_timeline.csv` | AD version 2's combined timeline, recomputed for the reviewed audio |
+| `processing_report.csv` | AD version 2's report columns: `pass1_` columns are each line's take (ElevenLabs as delivered), `fit_speed` and `pass2_` columns the audio as reviewed |
+| `<script>_qc.xlsx` | The workbook (uploaded, or the run's `script.xlsx`) with edited lines written into TARGET DIALOGUE. Changed cells are highlighted and carry a note with the script wording (and any speed set in review). Nothing else in the workbook changes. |
 | `qc_changes.csv` | One row per line changed in review: Excel row, character, TCR IN, script wording, reviewed wording, line speed set in review (empty if only the words changed) |
 
 The session stays open after exporting, so the reviewer can keep working and export again.

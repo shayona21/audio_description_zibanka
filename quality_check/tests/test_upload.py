@@ -119,7 +119,7 @@ class DubbingTests(unittest.TestCase):
         expected = {}
         with zipfile.ZipFile(io.BytesIO(dub_zip(self.tmp.name, ONE_EPISODE))) as archive:
             for name in ("KUHU", "AMRITA"):
-                with wave.open(io.BytesIO(archive.read(f"tracks/Episode_1_{name}.wav"))) as wav:
+                with wave.open(io.BytesIO(archive.read(f"pass2/tracks/ep1_{name.lower()}.wav"))) as wav:
                     expected[name] = wav.readframes(wav.getnframes())
         folder = self.runtime / sid
         for track in record["audio"]["tracks"]:
@@ -375,7 +375,7 @@ class DubbingTests(unittest.TestCase):
     def export(self, client, sid):
         response = client.get(f"/session/{sid}/export")
         self.assertEqual(response.status_code, 200, response.data[:300])
-        self.assertIn("Episode_1_QC.zip", response.headers["Content-Disposition"])
+        self.assertIn("ep1_qc.zip", response.headers["Content-Disposition"])
         data = response.data
         response.close()
         return zipfile.ZipFile(io.BytesIO(data))
@@ -387,19 +387,22 @@ class DubbingTests(unittest.TestCase):
         self.speed(client, sid, 6, 1.1)
         archive = self.export(client, sid)
         names = sorted(archive.namelist())
-        self.assertEqual(names, ["Episode_1_AMRITA.wav", "Episode_1_KUHU.wav", "Episode_1_timeline.csv",
-                                 "processing_report.csv", "qc_changes.csv", "script_QC.xlsx"])
+        self.assertEqual(names, ["ep1_amrita.wav", "ep1_kuhu.wav", "ep1_timeline.csv",
+                                 "processing_report.csv", "qc_changes.csv", "script_qc.xlsx"])
         # Tracks are exactly what the reviewer heard.
-        self.assertEqual(archive.read("Episode_1_AMRITA.wav"), self.track_bytes(sid, 1))
+        self.assertEqual(archive.read("ep1_amrita.wav"), self.track_bytes(sid, 1))
         # V2's report columns, with the reviewed timings.
-        report = archive.read("processing_report.csv").decode("utf-8-sig").splitlines()
-        self.assertTrue(report[0].startswith("excel_row,episode,character,voice_id,start_TCR"))
-        self.assertTrue(report[0].endswith(",fit_speed"))
-        self.assertEqual(len(report), 6)
-        self.assertTrue(report[1].endswith(",0.70"))      # row 2: pass 2's fit
-        self.assertTrue(report[5].endswith(",1.10"))      # row 6: the reviewer's speed
+        import csv
+        from v2.exporter import REPORT_FIELDS
+        reader = csv.DictReader(io.StringIO(archive.read("processing_report.csv").decode("utf-8-sig")))
+        report = {int(r["excel_row"]): r for r in reader}
+        self.assertEqual(tuple(reader.fieldnames), REPORT_FIELDS)
+        self.assertEqual(sorted(report), [2, 3, 4, 5, 6])
+        self.assertEqual(report[2]["fit_speed"], "0.70")                          # pass 2's fit
+        self.assertEqual(report[6]["fit_speed"], "1.10")                          # the reviewer's speed
+        self.assertEqual(report[6]["pass1_duration_ms"], str(natural_ms(ONE_EPISODE[4][6])))  # the take
         # The Excel: edited text in TARGET DIALOGUE, highlighted with a note; other rows untouched.
-        with archive.open("script_QC.xlsx") as handle:
+        with archive.open("script_qc.xlsx") as handle:
             sheet = load_workbook(io.BytesIO(handle.read())).active
         self.assertEqual(sheet.cell(row=3, column=7).value, "[Angry] Get out!")
         self.assertIn("Script wording: [Angry] You beggar", sheet.cell(row=3, column=7).comment.text)
@@ -415,7 +418,7 @@ class DubbingTests(unittest.TestCase):
         from openpyxl import load_workbook
         client, sid, _record = self.dubbed()
         archive = self.export(client, sid)
-        with archive.open("script_QC.xlsx") as handle:
+        with archive.open("script_qc.xlsx") as handle:
             sheet = load_workbook(io.BytesIO(handle.read())).active
         self.assertEqual([sheet.cell(row=r, column=7).value for r in range(2, 7)], [r[6] for r in ONE_EPISODE])
         self.assertEqual(len(archive.read("qc_changes.csv").decode("utf-8-sig").splitlines()), 1)
@@ -505,11 +508,12 @@ class ImportTests(unittest.TestCase):
         with zipfile.ZipFile(self.v2_runtime / run_id / "AD_v2_output.zip") as archive:
             # The tracks rebuilt from the line clips are V2's tracks, sample for sample.
             for track in record["audio"]["tracks"]:
-                with wave.open(io.BytesIO(archive.read(f"tracks/Episode_1_{track['character']}.wav"))) as wav:
+                with wave.open(io.BytesIO(archive.read(f"pass2/tracks/ep1_{track['character'].lower()}.wav"))) as wav:
                     expected = wav.readframes(wav.getnframes())
                 with wave.open(str(folder / "tracks" / f"{track['index']}.wav")) as wav:
                     self.assertEqual(wav.readframes(wav.getnframes()), expected, track["character"])
-            self.assertEqual((folder / "clips" / "4.wav").read_bytes(), archive.read("lines/1_KUHU_4.wav"))
+            self.assertEqual((folder / "clips" / "4.wav").read_bytes(), archive.read("pass2/lines/ep1_kuhu_row4.wav"))
+            self.assertEqual((folder / "clips" / "4.take.wav").read_bytes(), archive.read("pass1/lines/ep1_kuhu_row4.wav"))
         lines = {line["row"]: line for line in record["audio"]["lines"]}
         self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
                          {2: 0.7, 3: 0.7, 4: 1.5, 5: 0.7, 6: 0.81})     # from V2's report
@@ -535,7 +539,7 @@ class ImportTests(unittest.TestCase):
         line = next(l for l in body["audio"]["lines"] if l["row"] == 3)
         self.assertEqual((line["fit_speed"], line["edited"]), (0.7, True))
         archive = zipfile.ZipFile(io.BytesIO(self.client.get(f"/session/{sid}/export").data))
-        self.assertIn("Episode_1_KUHU.wav", archive.namelist())
+        self.assertIn("ep1_kuhu.wav", archive.namelist())
 
     def test_uploaded_zip_finds_the_frame_rate_the_run_used(self):
         data = dub_zip(self.tmp.name, ONE_EPISODE + SECOND_EPISODE, name="thirty.zip", fps=30)
@@ -557,11 +561,11 @@ class ImportTests(unittest.TestCase):
         self.assertIn("not a ZIP", upload(b"not a zip").get_json()["error"])
         self.assertEqual(upload(b"x", "run.xlsx").status_code, 400)
         old = io.BytesIO()
-        with zipfile.ZipFile(old, "w") as archive:          # an older V2 ZIP: tracks only
-            archive.writestr("Episode_1_KUHU.wav", b"RIFF")
+        with zipfile.ZipFile(old, "w") as archive:          # an earlier V2 ZIP: lines/ at the top, no passes
+            archive.writestr("lines/1_KUHU_2.wav", b"RIFF")
         response = upload(old.getvalue())
         self.assertEqual(response.status_code, 400)
-        self.assertIn("no line clips", response.get_json()["error"])
+        self.assertIn("earlier AD Tool V2", response.get_json()["error"])
         self.assertFalse(any((self.runtime / "uploads").iterdir()))      # refused uploads are not kept
 
         run_id = self.server_run(rows=ONE_EPISODE)
@@ -571,7 +575,7 @@ class ImportTests(unittest.TestCase):
         # A clip missing from the ZIP is reported by row before anything is stored.
         path = self.v2_runtime / run_id / "AD_v2_output.zip"
         with zipfile.ZipFile(path) as archive:
-            items = {name: archive.read(name) for name in archive.namelist() if name != "lines/1_AMRITA_3.wav"}
+            items = {name: archive.read(name) for name in archive.namelist() if name != "pass2/lines/ep1_amrita_row3.wav"}
         with zipfile.ZipFile(path, "w") as archive:
             for name, data in items.items():
                 archive.writestr(name, data)

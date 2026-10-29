@@ -93,8 +93,9 @@
                     </p>
                     <p class="voice-preview-note">Each line is fitted to its slot (TCR IN to TCR OUT) automatically: a line more than
                         0.1 s too long or too short is sped up or slowed down with FFmpeg, between 0.70x and 1.50x, keeping the voice's pitch.</p>
-                    <p class="voice-preview-note">The ZIP holds <b>tracks/</b> (one WAV per episode and character), <b>lines/</b> (one WAV per
-                        dialogue row, named episode_character_row), a combined timeline CSV per episode, a timing report and a copy of the script.
+                    <p class="voice-preview-note">The ZIP holds <b>pass1/</b> (ElevenLabs as delivered) and <b>pass2/</b> (fitted to the slots), each with
+                        <b>tracks/</b> (one WAV per episode and character, e.g. ep1_kuhu.wav) and <b>lines/</b> (one WAV per dialogue row, e.g.
+                        ep1_kuhu_row2.wav), plus a combined timeline CSV per episode, a timing report comparing both passes and a copy of the script.
                         It can be opened directly in the Dubbing Quality Check.
                         A line starts at its scripted time or when that character's previous audio ends, whichever is later.
                         Overruns use available silence; other characters keep their own timing. Tracks remain aligned from 00:00:00:00.</p>

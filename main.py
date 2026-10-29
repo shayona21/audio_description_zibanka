@@ -14,6 +14,7 @@ from tts_client import (
     validate_language, validate_provider,
 )
 from audio_builder import build_master_timeline, export_wav
+from audio_overlap import fix_overlaps
 from audio_speed import adjust_audio_speed, check_speed_support
 
 load_dotenv()
@@ -55,7 +56,9 @@ def run(excel_path, output_path="output_AD.wav", speed=1.0,
 
     # Step 4: Build master timeline
     print(f"\nStep 3: Building master timeline...")
-    master = build_master_timeline(rows, audio_clips, episode_duration_ms)
+    rows = rows[:len(audio_clips)]
+    audio_clips, starts_ms = fix_overlaps(rows, audio_clips)
+    master = build_master_timeline(rows, audio_clips, starts_ms, episode_duration_ms)
 
     # Step 5: Export
     print(f"\nStep 4: Exporting...")

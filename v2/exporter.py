@@ -9,20 +9,34 @@ def safe_component(value):
 
 
 # ZIP layout. Quality Check reads these names when it imports a run, so keep both tools in step.
-TRACKS_DIR = "tracks"          # one full-length timeline WAV per <character, episode>
-LINES_DIR = "lines"            # one WAV per dubbed row
+PASS1_DIR = "pass1"            # ElevenLabs as delivered
+PASS2_DIR = "pass2"            # each line fitted to its slot with FFmpeg (what is delivered)
+TRACKS_DIR = "tracks"          # in each pass: one full-length timeline WAV per <character, episode>
+LINES_DIR = "lines"            # in each pass: one WAV per dubbed row
 SCRIPT_NAME = "script.xlsx"    # copy of the input workbook
 
 
+def name_part(value):
+    """One part of a file name: safe on every system, lowercase, spaces as underscores."""
+    return re.sub(r"\s+", "_", safe_component(value)).lower()
+
+
+def episode_tag(episode):
+    """``ep<EP NO>``: EP NO 1 gives ``ep1``; EP01 and "EP 2" give ``ep01`` and ``ep2`` (never ``epep``)."""
+    part = name_part(episode)
+    return re.sub(r"^ep[_-]*", "ep", part) if part.startswith("ep") else f"ep{part}"
+
+
 def line_name(row):
-    """``<episode>_<character>_<Excel row>.wav``; the row number makes every name unique."""
-    return f"{safe_component(row.episode)}_{safe_component(row.character)}_{row.row_number}.wav"
+    """``ep<episode>_<character>_row<Excel row>.wav``; the row number makes every name unique."""
+    return f"{episode_tag(row.episode)}_{name_part(row.character)}_row{row.row_number}.wav"
 
 
 def track_names(groups):
+    """``ep<episode>_<character>.wav`` per group; names that only differed in case get _2, _3..."""
     names, used = {}, set()
     for episode, character in sorted(groups):
-        stem = f"Episode_{safe_component(episode)}_{safe_component(character)}"
+        stem = f"{episode_tag(episode)}_{name_part(character)}"
         name, suffix = f"{stem}.wav", 2
         while name.casefold() in used:
             name = f"{stem}_{suffix}.wav"
@@ -32,9 +46,11 @@ def track_names(groups):
     return names
 
 
-REPORT_FIELDS = ("excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR",
-                 "duration", "actual_duration_ms", "overrun_amnt_ms", "status", "track",
-                 "adjusted_start_TCR", "adjusted_end_TCR", "fit_speed")
+# One record per row, pass 1 and pass 2 side by side. duration is the slot (TCR OUT - TCR IN) in ms;
+# status, track and the adjusted TCRs describe pass 2, the audio delivered.
+REPORT_FIELDS = ("excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "duration",
+                 "pass1_duration_ms", "pass1_overrun_ms", "fit_speed", "pass2_duration_ms", "pass2_overrun_ms",
+                 "status", "track", "adjusted_start_TCR", "adjusted_end_TCR")
 
 TIMELINE_FIELDS = ("Dialogue", "Original time start", "Original time end",
                    "Adjusted time start", "Adjusted time end", "Delay")
@@ -43,7 +59,7 @@ TIMELINE_FIELDS = ("Dialogue", "Original time start", "Original time end",
 def timeline_names(episodes):
     names, used = {}, set()
     for episode in sorted(episodes):
-        stem = f"Episode_{safe_component(episode)}_timeline"
+        stem = f"{episode_tag(episode)}_timeline"
         name, suffix = f"{stem}.csv", 2
         while name.casefold() in used:
             name = f"{stem}_{suffix}.csv"
