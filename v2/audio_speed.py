@@ -1,4 +1,4 @@
-"""Pass 2: fit each dubbed line to its slot by changing its speed with FFmpeg (pitch preserved).
+"""Leading-silence trim (every take) and pass 2: fit each dubbed line to its slot by changing its speed with FFmpeg (pitch preserved).
 
 After ElevenLabs (pass 1), the spoken part of each clip is measured (silence ElevenLabs adds before and
 after the voice is not counted) and compared with the scripted slot, TCR OUT - TCR IN. A line more
@@ -63,6 +63,48 @@ def change_speed(wav_bytes, speed):
     if not result.stdout:
         raise RuntimeError("FFmpeg returned no audio after speed adjustment")
     return result.stdout
+
+
+LEADING_SILENCE_DBFS = -60  # same cut-off as measure_leading_silence.py: a breath or click counts as sound
+
+
+def trim_leading_silence(wav_bytes):
+    """Remove the blank audio ElevenLabs puts before the first sound, so the line starts exactly at
+    TCR IN. Returns ``(trimmed wav, ms removed)``.
+
+    FFmpeg's ``silenceremove`` finds where the first sound starts (the first 10 ms window louder than
+    LEADING_SILENCE_DBFS). The cut itself is made here, on a whole-millisecond boundary just before
+    that point, so the speech samples stay exactly as ElevenLabs delivered them."""
+    check_ffmpeg()
+    with wave.open(io.BytesIO(wav_bytes)) as wav:
+        rate, channels, width = wav.getframerate(), wav.getnchannels(), wav.getsampwidth()
+        before = wav.getnframes()
+        frames = wav.readframes(before)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+             "-i", "pipe:0", "-af",
+             f"silenceremove=start_periods=1:start_threshold={LEADING_SILENCE_DBFS}dB"
+             ":start_silence=0:start_duration=0:detection=rms:window=0.01",
+             "-ar", str(rate), "-ac", str(channels), "-f", "s16le", "pipe:1"],
+            input=wav_bytes, capture_output=True, check=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Leading silence trim timed out") from exc
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("FFmpeg could not trim the leading silence") from exc
+    after = len(result.stdout) // (2 * channels)
+    frames_per_ms = max(1, rate // 1000)
+    cut = (before - after) // frames_per_ms * frames_per_ms   # whole ms, never past the first sound
+    if after == 0 or cut == 0:  # all blank, or under 1 ms to cut: keep as delivered
+        return wav_bytes, 0
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(width)
+        wav.setframerate(rate)
+        wav.writeframes(frames[cut * width * channels:])
+    return output.getvalue(), cut // frames_per_ms
 
 
 def speech_span(wav_bytes):

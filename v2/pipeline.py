@@ -1,7 +1,7 @@
-"""Parse → synthesize each row (pass 1) → fit each line to its slot (pass 2) → place → tracks → ZIP.
+"""Parse → synthesize each row and trim its leading silence (pass 1) → fit each line to its slot (pass 2) → place → tracks → ZIP.
 
 ZIP layout (Quality Check reads it when it imports a run). Names are lowercase, spaces as "_":
-  pass1/lines/ep<ep>_<character>_row<row>.wav   ElevenLabs as delivered, one per dubbed row
+  pass1/lines/ep<ep>_<character>_row<row>.wav   ElevenLabs take with its leading blank audio removed, one per dubbed row
   pass1/tracks/ep<ep>_<character>.wav           one timeline per <character, episode>, from pass 1 lines
   pass2/lines/ep<ep>_<character>_row<row>.wav   the same lines fitted to their slots with FFmpeg
   pass2/tracks/ep<ep>_<character>.wav           one timeline per <character, episode>, from pass 2 lines
@@ -19,7 +19,7 @@ import shutil
 import tempfile
 
 from .audio_builder import build_track, read_clip
-from .audio_speed import check_ffmpeg, fit_to_slot
+from .audio_speed import check_ffmpeg, fit_to_slot, trim_leading_silence
 from .excel_parser import parse_excel
 from .exporter import (LINES_DIR, PASS1_DIR, PASS2_DIR, SCRIPT_NAME, TRACKS_DIR, export_archive, format_tcr,
                        line_name, track_names, timeline_names, write_report, write_timeline)
@@ -38,14 +38,14 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
         raise ValueError("Output must be a .zip file")
     if output_path.exists():
         raise ValueError(f"Output already exists: {output_path}; choose a new filename")
-    if fit_lines:
-        check_ffmpeg()  # before any ElevenLabs request is paid for
+    check_ffmpeg()  # leading-silence trim and pass 2 both need it; checked before any ElevenLabs request
     synthesize = synthesize if synthesize is not None else ElevenLabsClient()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     names = track_names({row.group for row in rows})
     lengths = {PASS1_DIR: {}, PASS2_DIR: {}}   # pass -> {row: clip length in ms}
     clip_paths = {PASS1_DIR: {}, PASS2_DIR: {}}
     fit_speeds = {}
+    trimmed_ms = {}
 
     def update_state(percent, phase):
         if progress_state is not None:
@@ -62,11 +62,14 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
             progress(f"Generating {index}/{len(rows)}: Excel row {row.row_number}, episode {row.episode}, {row.character}")
             try:
                 take = synthesize(row.text, row.voice_id)
+                take, trimmed = trim_leading_silence(take)
                 take_ms = len(read_clip(take))
                 fitted, speed = fit_to_slot(take, row.end_ms - row.start_ms) if fit_lines else (take, 1.0)
                 fitted_ms = len(read_clip(fitted))
             except Exception as exc:
                 raise RuntimeError(f"Excel row {row.row_number}: {exc}") from exc
+            progress(f"Excel row {row.row_number}: trimmed {trimmed} ms of leading silence")
+            trimmed_ms[row.row_number] = trimmed
             if speed != 1.0:
                 progress(f"Fitted Excel row {row.row_number} to its slot at {speed:.2f}x")
             for pass_dir, wav, length in ((PASS1_DIR, take, take_ms), (PASS2_DIR, fitted, fitted_ms)):
@@ -111,7 +114,7 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
             records.append(dict(excel_row=row.row_number, episode=row.episode,
                                 character=row.character, voice_id=row.voice_id,
                                 start_TCR=format_tcr(row.start_ms, fps), end_TCR=format_tcr(row.end_ms, fps),
-                                duration=slot,
+                                duration=slot, leading_trim_ms=trimmed_ms[row.row_number],
                                 pass1_duration_ms=pass1_ms, pass1_overrun_ms=max(0, pass1_ms - slot),
                                 fit_speed=f"{fit_speeds[row.row_number]:.2f}",
                                 pass2_duration_ms=pass2_ms, pass2_overrun_ms=overrun,

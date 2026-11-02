@@ -48,7 +48,7 @@ def track_names(groups):
 
 # One record per row, pass 1 and pass 2 side by side. duration is the slot (TCR OUT - TCR IN) in ms;
 # status, track and the adjusted TCRs describe pass 2, the audio delivered.
-REPORT_FIELDS = ("excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "duration",
+REPORT_FIELDS = ("excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "duration", "leading_trim_ms",
                  "pass1_duration_ms", "pass1_overrun_ms", "fit_speed", "pass2_duration_ms", "pass2_overrun_ms",
                  "status", "track", "adjusted_start_TCR", "adjusted_end_TCR")
 
