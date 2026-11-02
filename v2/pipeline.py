@@ -21,7 +21,7 @@ import tempfile
 from .audio_builder import build_track, read_clip
 from .audio_speed import check_ffmpeg, fit_to_slot, trim_leading_silence
 from .excel_parser import parse_excel
-from .exporter import (LINES_DIR, PASS1_DIR, PASS2_DIR, SCRIPT_NAME, TRACKS_DIR, export_archive, format_tcr,
+from .exporter import (LINES_DIR, PASS1_DIR, PASS2_DIR, SCRIPT_NAME, TRACKS_DIR, StreamingArchive, format_tcr,
                        line_name, track_names, timeline_names, write_report, write_timeline)
 from .timing import place_dialogue
 from .tts_client import ElevenLabsClient
@@ -83,54 +83,61 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
         progress("Resolving audio collisions independently for each episode and character")
         placements = {pass_dir: {p.row.row_number: p for p in place_dialogue(rows, lengths[pass_dir])}
                       for pass_dir in (PASS1_DIR, PASS2_DIR)}
-        files = [path for pass_dir in (PASS1_DIR, PASS2_DIR) for path in clip_paths[pass_dir].values()]
+        # Disk use is kept low by streaming into the ZIP: each full-length track goes into the ZIP
+        # the moment it is built and its WAV is deleted, so only one track is ever on disk.
+        # Tracks are mostly silence, which the ZIP compresses to almost nothing.
+        with StreamingArchive(output_path) as archive:
+            for pass_dir in (PASS1_DIR, PASS2_DIR):
+                for path in clip_paths[pass_dir].values():
+                    archive.add(path, path.relative_to(workspace).as_posix())
 
-        update_state(90, "Building character tracks")
-        for step, pass_dir in enumerate((PASS1_DIR, PASS2_DIR)):
-            groups, episode_ends = defaultdict(list), defaultdict(int)
-            for placed in placements[pass_dir].values():
-                row = placed.row
-                groups[row.group].append((placed, clip_paths[pass_dir][row.row_number]))
-                episode_ends[row.episode] = max(episode_ends[row.episode], row.end_ms, placed.end_ms)
-            for index, group in enumerate(sorted(groups), start=1):
-                progress(f"Building {pass_dir}/{names[group]}")
-                track_path = workspace / pass_dir / TRACKS_DIR / names[group]
-                build_track(groups[group], episode_ends[group[0]], track_path)
-                files.append(track_path)
-                update_state(90 + round((step + index / len(groups)) * 4.5), "Building character tracks")
+            update_state(90, "Building character tracks")
+            for step, pass_dir in enumerate((PASS1_DIR, PASS2_DIR)):
+                groups, episode_ends = defaultdict(list), defaultdict(int)
+                for placed in placements[pass_dir].values():
+                    row = placed.row
+                    groups[row.group].append((placed, clip_paths[pass_dir][row.row_number]))
+                    episode_ends[row.episode] = max(episode_ends[row.episode], row.end_ms, placed.end_ms)
+                for index, group in enumerate(sorted(groups), start=1):
+                    progress(f"Building {pass_dir}/{names[group]}")
+                    track_path = workspace / pass_dir / TRACKS_DIR / names[group]
+                    build_track(groups[group], episode_ends[group[0]], track_path)
+                    archive.add(track_path, track_path.relative_to(workspace).as_posix(), delete=True)
+                    update_state(90 + round((step + index / len(groups)) * 4.5), "Building character tracks")
 
-        records = []
-        episode_timelines = defaultdict(list)
-        for row in rows:
-            placed = placements[PASS2_DIR][row.row_number]
-            episode_timelines[row.episode].append(placed)
-            slot = row.end_ms - row.start_ms
-            pass1_ms = lengths[PASS1_DIR][row.row_number]
-            pass2_ms = placed.end_ms - placed.start_ms
-            overrun = max(0, pass2_ms - slot)
-            status = "TCR_OUT_OVERRUN" if overrun else "OK"
-            if overrun:
-                progress(f"Review Excel row {row.row_number}: {status}")
-            records.append(dict(excel_row=row.row_number, episode=row.episode,
-                                character=row.character, voice_id=row.voice_id,
-                                start_TCR=format_tcr(row.start_ms, fps), end_TCR=format_tcr(row.end_ms, fps),
-                                duration=slot, leading_trim_ms=trimmed_ms[row.row_number],
-                                pass1_duration_ms=pass1_ms, pass1_overrun_ms=max(0, pass1_ms - slot),
-                                fit_speed=f"{fit_speeds[row.row_number]:.2f}",
-                                pass2_duration_ms=pass2_ms, pass2_overrun_ms=overrun,
-                                status=status, track=names[row.group],
-                                adjusted_start_TCR=format_tcr(placed.start_ms, fps),
-                                adjusted_end_TCR=format_tcr(placed.end_ms, fps)))
-        for episode, name in timeline_names(episode_timelines).items():
-            timeline_path = workspace / name
-            write_timeline(timeline_path, episode_timelines[episode])
-            files.append(timeline_path)
-        report_path = workspace / "processing_report.csv"
-        write_report(report_path, sorted(records, key=lambda record: record["excel_row"]))
-        script_copy = workspace / SCRIPT_NAME
-        shutil.copyfile(excel_path, script_copy)
-        update_state(99, "Packaging download")
-        export_archive(output_path, files + [report_path, script_copy], root=workspace)
+            records = []
+            episode_timelines = defaultdict(list)
+            for row in rows:
+                placed = placements[PASS2_DIR][row.row_number]
+                episode_timelines[row.episode].append(placed)
+                slot = row.end_ms - row.start_ms
+                pass1_ms = lengths[PASS1_DIR][row.row_number]
+                pass2_ms = placed.end_ms - placed.start_ms
+                overrun = max(0, pass2_ms - slot)
+                status = "TCR_OUT_OVERRUN" if overrun else "OK"
+                if overrun:
+                    progress(f"Review Excel row {row.row_number}: {status}")
+                records.append(dict(excel_row=row.row_number, episode=row.episode,
+                                    character=row.character, voice_id=row.voice_id,
+                                    start_TCR=format_tcr(row.start_ms, fps), end_TCR=format_tcr(row.end_ms, fps),
+                                    duration=slot, leading_trim_ms=trimmed_ms[row.row_number],
+                                    pass1_duration_ms=pass1_ms, pass1_overrun_ms=max(0, pass1_ms - slot),
+                                    fit_speed=f"{fit_speeds[row.row_number]:.2f}",
+                                    pass2_duration_ms=pass2_ms, pass2_overrun_ms=overrun,
+                                    status=status, track=names[row.group],
+                                    adjusted_start_TCR=format_tcr(placed.start_ms, fps),
+                                    adjusted_end_TCR=format_tcr(placed.end_ms, fps)))
+            update_state(99, "Packaging download")
+            for episode, name in timeline_names(episode_timelines).items():
+                timeline_path = workspace / name
+                write_timeline(timeline_path, episode_timelines[episode])
+                archive.add(timeline_path, name)
+            report_path = workspace / "processing_report.csv"
+            write_report(report_path, sorted(records, key=lambda record: record["excel_row"]))
+            archive.add(report_path, report_path.name)
+            script_copy = workspace / SCRIPT_NAME
+            shutil.copyfile(excel_path, script_copy)
+            archive.add(script_copy, SCRIPT_NAME)
     summary = {"output": str(output_path), "rows": len(rows), "tracks": len(names),
                "flagged_rows": sum(record["status"] != "OK" for record in records),
                "fitted_rows": sum(speed != 1.0 for speed in fit_speeds.values())}

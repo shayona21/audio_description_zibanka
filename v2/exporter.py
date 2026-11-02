@@ -1,5 +1,6 @@
 import csv
 import re
+from pathlib import Path
 import zipfile
 
 
@@ -118,6 +119,37 @@ def write_csv(path, records, fields):
                           and value.lstrip().startswith(("=", "+", "-", "@")) else value)
                     for key, value in record.items()}
             writer.writerow(safe)
+
+
+class StreamingArchive:
+    """A ZIP written one file at a time, so big files can be deleted as soon as they are inside.
+
+    Used as ``with StreamingArchive(output) as archive: archive.add(path, name, delete=True)``.
+    Written to ``<output>.zip.partial`` and renamed only when the block finishes without an error,
+    so a failed run never leaves a half-written ZIP behind under the real name."""
+
+    def __init__(self, output_path):
+        self.output_path = Path(output_path)
+        self.temporary = self.output_path.with_suffix(".zip.partial")
+        self.archive = None
+
+    def __enter__(self):
+        self.archive = zipfile.ZipFile(self.temporary, "w", compression=zipfile.ZIP_DEFLATED)
+        return self
+
+    def add(self, path, arcname, delete=False):
+        self.archive.write(path, arcname=arcname)
+        if delete:
+            Path(path).unlink()
+
+    def __exit__(self, exc_type, _exc, _tb):
+        try:
+            self.archive.close()
+            if exc_type is None:
+                self.temporary.replace(self.output_path)
+        finally:
+            self.temporary.unlink(missing_ok=True)
+        return False
 
 
 def export_archive(output_path, files, root=None):

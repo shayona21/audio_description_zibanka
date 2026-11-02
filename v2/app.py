@@ -4,6 +4,8 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import threading
 import time
 import uuid
@@ -20,6 +22,66 @@ from .tts_client import ElevenLabsClient
 
 
 RUN_RECORD = "run.json"
+JOB_ID = re.compile(r"[0-9a-f]{32}")
+# Finished and failed runs are deleted after this long (download or import into Quality Check
+# within it). Same retention as Quality Check's sessions.
+RUN_MAX_AGE_SECONDS = 24 * 60 * 60
+CLEANUP_INTERVAL_SECONDS = 60 * 60
+# Refuse to start a run the disk can't hold, rather than fail at the end after every ElevenLabs
+# request has been paid for. Never start below MIN_FREE_BYTES, whatever the estimate says.
+MIN_FREE_BYTES = 2 * 1024 ** 3
+GB = 1024 ** 3
+BYTES_PER_MS = 48            # 24 kHz, mono, 16-bit WAV
+SIZE_SAFETY = 1.25           # lines can run past TCR OUT, so tracks can end later than the script
+
+
+def estimate_run_bytes(rows):
+    """Peak disk use of one run. Tracks are streamed into the ZIP one at a time (pipeline.py), so the
+    peak is: every line clip for both passes (uncompressed, in the work folder), one full-length track
+    being built, and the ZIP. In the ZIP, a track's silence compresses to almost nothing, so the ZIP
+    is counted as its speech only, uncompressed: both passes' lines plus the same speech in tracks."""
+    episode_end = {}
+    for row in rows:
+        episode_end[row.episode] = max(episode_end.get(row.episode, 0), row.end_ms)
+    lines_ms = sum(row.end_ms - row.start_ms for row in rows)
+    work_files = 2 * lines_ms                 # pass 1 + pass 2 line clips
+    one_track = max(episode_end.values(), default=0)
+    archive = 2 * 2 * lines_ms                # lines + their speech in tracks, both passes
+    return int((work_files + one_track + archive) * BYTES_PER_MS * SIZE_SAFETY)
+
+
+def remove_old_runs(runtime, jobs, max_age=RUN_MAX_AGE_SECONDS):
+    """Delete run folders older than ``max_age`` that are not running. Returns how many were removed."""
+    if not runtime.is_dir():
+        return 0
+    cutoff = time.time() - max_age
+    removed = 0
+    for folder in runtime.iterdir():
+        if not (folder.is_dir() and JOB_ID.fullmatch(folder.name)):
+            continue
+        if jobs.get(folder.name, {}).get("status") == "running":
+            continue
+        try:
+            newest = max([folder.stat().st_mtime] + [f.stat().st_mtime for f in folder.iterdir()])
+        except OSError:
+            continue
+        if newest < cutoff:
+            shutil.rmtree(folder, ignore_errors=True)
+            jobs.pop(folder.name, None)
+            removed += 1
+    return removed
+
+
+def start_cleanup_thread(cleanup, interval=CLEANUP_INTERVAL_SECONDS):
+    """Run ``cleanup`` now and then every ``interval`` seconds, so old files go even when nobody uploads."""
+    def loop():
+        while True:
+            try:
+                cleanup()
+            except Exception as exc:  # never let cleanup take the app down
+                print(f"Cleanup failed: {exc}", flush=True)
+            time.sleep(interval)
+    threading.Thread(target=loop, name="runtime-cleanup", daemon=True).start()
 
 
 def write_run_record(job_dir, record):
@@ -38,6 +100,14 @@ def create_app(config=None):
     runtime = Path(app.config["RUNTIME_DIR"])
     jobs = {}
     app.extensions["ad_v2_jobs"] = jobs
+
+    def cleanup():
+        removed = remove_old_runs(runtime, jobs)
+        if removed:
+            print(f"Removed {removed} run folder(s) older than {RUN_MAX_AGE_SECONDS // 3600} hours", flush=True)
+
+    if not app.config.get("TESTING"):
+        start_cleanup_thread(cleanup)
 
     @app.get("/")
     def index():
@@ -83,6 +153,7 @@ def create_app(config=None):
         if not output_name:
             return jsonify(error="Please enter an output file name"), 400
         download_name = safe_component(output_name) + ".zip"
+        cleanup()
         job_id = uuid.uuid4().hex
         job_dir = runtime / job_id
         job_dir.mkdir(parents=True)
@@ -95,6 +166,14 @@ def create_app(config=None):
             upload_path.unlink(missing_ok=True)
             job_dir.rmdir()
             return jsonify(error=f"Workbook validation failed: {exc}"), 400
+        free = shutil.disk_usage(runtime).free
+        needed = max(app.config.get("MIN_FREE_BYTES", MIN_FREE_BYTES), estimate_run_bytes(rows))
+        if free < needed:
+            upload_path.unlink(missing_ok=True)
+            job_dir.rmdir()
+            return jsonify(error=f"Not enough server storage for this script: it needs about "
+                                 f"{needed / GB:.1f} GB and {free / GB:.1f} GB is free. Split the script "
+                                 "into smaller files (e.g. one episode each) or ask an admin to free space."), 507
         try:
             synthesize = app.config.get("SYNTHESIZE")
             if synthesize is None:

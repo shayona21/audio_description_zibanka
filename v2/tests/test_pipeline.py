@@ -526,6 +526,48 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(runtime.exists())
         self.assertNotIn('name="speed"', app.test_client().get("/").get_data(as_text=True))
 
+    def test_old_runs_are_removed_but_running_and_recent_runs_kept(self):
+        import os, time
+        from v2.app import RUN_MAX_AGE_SECONDS, remove_old_runs
+        runtime = self.root / "runtime"
+        old, recent, running = "a" * 32, "b" * 32, "c" * 32
+        stale = time.time() - RUN_MAX_AGE_SECONDS - 60
+        for name in (old, recent, running):
+            (runtime / name).mkdir(parents=True)
+            (runtime / name / "AD_v2_output.zip").write_bytes(b"zip")
+        (runtime / "notes").mkdir()                           # not a run folder: never touched
+        for name in (old, running):
+            for path in (runtime / name, runtime / name / "AD_v2_output.zip"):
+                os.utime(path, (stale, stale))
+        jobs = {old: {"status": "done"}, running: {"status": "running"}}
+        self.assertEqual(remove_old_runs(runtime, jobs), 1)
+        self.assertEqual(sorted(p.name for p in runtime.iterdir()), sorted([recent, running, "notes"]))
+        self.assertNotIn(old, jobs)
+
+    def test_upload_refused_when_storage_is_nearly_full(self):
+        synthesize = Mock()
+        runtime = self.root / "runtime"
+        app = create_app({"TESTING": True, "RUNTIME_DIR": runtime, "SYNTHESIZE": synthesize,
+                          "MIN_FREE_BYTES": 10 ** 18})
+        path = self.workbook([dialogue()])
+        with patch("v2.app.threading.Thread") as thread:
+            response = app.test_client().post("/upload", data={
+                "file": (io.BytesIO(path.read_bytes()), "input.xlsx")})
+        self.assertEqual(response.status_code, 507)
+        self.assertIn("Not enough server storage", response.json["error"])
+        thread.assert_not_called()
+        synthesize.assert_not_called()
+        self.assertEqual(list(runtime.iterdir()), [])
+
+    def test_run_size_estimate_counts_dialogue_and_one_track(self):
+        from v2.app import estimate_run_bytes
+        rows = parse_excel(self.workbook([
+            dialogue(start="00:00:00:00", end="00:00:01:00"),
+            dialogue(character="Bob", voice="b", start="00:44:59:00", end="00:45:00:00"),
+        ]))
+        # 2 s of lines: 2x as work files + 4x in the ZIP; plus one 45 min track being built; 48 bytes/ms, x1.25
+        self.assertEqual(estimate_run_bytes(rows), int((6 * 2000 + 2_700_000) * 48 * 1.25))
+
     def test_fit_failure_discards_output(self):
         path = self.workbook([dialogue()])
         output = self.root / "failed-fit.zip"

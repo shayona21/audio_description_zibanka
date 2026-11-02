@@ -35,6 +35,7 @@ import uuid
 from dotenv import dotenv_values
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
+from v2.app import start_cleanup_thread   # same hourly cleanup loop as AD version 2
 from v2.audio_speed import MAX_FIT_SPEED, MIN_FIT_SPEED, check_ffmpeg, validate_speed
 from v2.excel_parser import SUPPORTED_FPS, parse_excel
 from v2.exporter import episode_tag
@@ -160,6 +161,9 @@ def create_app(config=None):
             for path in uploads.iterdir():
                 if path.stat().st_mtime < cutoff:
                     path.unlink(missing_ok=True)
+
+    if not app.config.get("TESTING"):
+        start_cleanup_thread(remove_old_sessions)
 
     # ------------------------------------------------------------------ request helpers
     def read_settings(values=None):
