@@ -27,7 +27,7 @@ import sys
 import wave
 
 from v2.audio_builder import build_track, read_clip
-from v2.audio_speed import change_speed, limit_speed, needed_speed
+from v2.audio_speed import change_speed, limit_speed, needed_speed, trim_leading_silence
 from v2.exporter import format_tcr
 from v2.timing import place_dialogue
 
@@ -73,10 +73,13 @@ def peaks_for(track_path):
 
 
 def synthesize_line(row, fps, synthesize):
-    """One ElevenLabs request for one row. Returns the WAV bytes as delivered (not yet saved)."""
+    """One ElevenLabs request for one row. Returns the WAV bytes with ElevenLabs' leading blank audio
+    trimmed (as V2's pipeline does), not yet saved."""
     try:
         wav = synthesize(row.text, row.voice_id)
         read_clip(wav)  # rejects empty or unreadable audio before anything is replaced
+        wav, trimmed = trim_leading_silence(wav)
+        print(f"Row {row.row_number}: trimmed {trimmed} ms of leading silence", flush=True)
         return wav
     except DubCancelled:
         raise

@@ -305,7 +305,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_report_exact_schema_and_frame_rate_calculations(self):
         headers = ["excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "duration",
-                   "pass1_duration_ms", "pass1_overrun_ms", "fit_speed", "pass2_duration_ms", "pass2_overrun_ms",
+                   "leading_trim_ms", "pass1_duration_ms", "pass1_overrun_ms", "fit_speed", "pass2_duration_ms", "pass2_overrun_ms",
                    "status", "track", "adjusted_start_TCR", "adjusted_end_TCR"]
         expected_ends = {24: "00:00:01:05", 25: "00:00:01:05", 30: "00:00:01:06",
                          50: "00:00:01:10", 60: "00:00:01:11"}
@@ -319,7 +319,7 @@ class PipelineTests(unittest.TestCase):
                     records = list(csv.reader(io.StringIO(archive.read("processing_report.csv").decode("utf-8-sig"))))
                     self.assertEqual(records, [headers, [
                         "2", "001", "Alice", "alice-voice", "00:00:00:01", "00:00:01:01",
-                        "1000", "1173", "173", "1.00", "1173", "173", "TCR_OUT_OVERRUN", "ep001_alice.wav",
+                        "1000", "0", "1173", "173", "1.00", "1173", "173", "TCR_OUT_OVERRUN", "ep001_alice.wav",
                         "00:00:00:01", end,
                     ]])
                     with wave.open(io.BytesIO(archive.read("pass2/tracks/ep001_alice.wav"))) as audio:
@@ -465,25 +465,40 @@ class PipelineTests(unittest.TestCase):
                 self.assertAlmostEqual(end - start, slot, delta=40)
             start, end, _ = speech_span(archive.read("pass2/lines/ep001_bob_row5.wav"))
             self.assertAlmostEqual(end - start, 4000 / 1.5, delta=40)
-            # A line within the tolerance is the ElevenLabs take, untouched.
-            self.assertEqual(archive.read("pass2/lines/ep001_alice_row4.wav"), self.spoken_clip(1050))
+            # A line within the tolerance keeps its pass 1 take (trimmed, not time-stretched).
+            self.assertEqual(archive.read("pass2/lines/ep001_alice_row4.wav"),
+                             archive.read("pass1/lines/ep001_alice_row4.wav"))
             # Tracks are built from exactly the clips in lines/, at their placements.
             alice = AudioSegment.from_wav(io.BytesIO(archive.read("pass2/tracks/ep001_alice.wav")))
             line = AudioSegment.from_wav(io.BytesIO(archive.read("pass2/lines/ep001_alice_row3.wav")))
             start_ms = timecode_to_ms(report[3]["adjusted_start_TCR"])
-            self.assertEqual(alice[start_ms:start_ms + len(line)].raw_data, line.raw_data)
+            offset = start_ms * 24 * 2   # 24 kHz, 16-bit: compare exact samples, not rounded ms
+            self.assertEqual(alice.raw_data[offset:offset + len(line.raw_data)], line.raw_data)
             self.assertEqual(int(report[3]["pass2_duration_ms"]), len(line))
-            # Pass 1 is ElevenLabs as delivered, with its own tracks placed by the same rule.
+            # Pass 1 is the ElevenLabs take with its 150 ms leading silence trimmed (speech starts at
+            # 0 ms, so at TCR IN); trailing silence is kept. Its tracks are placed by the same rule.
             for row, text in ((2, "long"), (3, "short"), (4, "fits")):
-                self.assertEqual(archive.read(f"pass1/lines/ep001_alice_row{row}.wav"), self.spoken_clip(speech[text]))
-            self.assertEqual(archive.read("pass1/lines/ep001_bob_row5.wav"), self.spoken_clip(4000))
-            self.assertEqual((int(report[2]["pass1_duration_ms"]), int(report[2]["pass1_overrun_ms"])), (2950, 950))
-            self.assertEqual(int(report[3]["pass1_overrun_ms"]), 150)   # 1.15 s clip (with silence) in 1.0 s
+                self.assertEqual(report[row]["leading_trim_ms"], "150")
+                start, end, clip_ms = speech_span(archive.read(f"pass1/lines/ep001_alice_row{row}.wav"))
+                self.assertEqual((start, end, clip_ms), (0, speech[text], speech[text] + 200))
+            self.assertEqual(report[5]["leading_trim_ms"], "150")
+            self.assertEqual((int(report[2]["pass1_duration_ms"]), int(report[2]["pass1_overrun_ms"])), (2800, 800))
+            self.assertEqual(int(report[3]["pass1_overrun_ms"]), 0)     # 1.0 s clip (speech + tail) in 1.0 s
             pass1 = AudioSegment.from_wav(io.BytesIO(archive.read("pass1/tracks/ep001_alice.wav")))
             first = AudioSegment.from_wav(io.BytesIO(archive.read("pass1/lines/ep001_alice_row2.wav")))
             self.assertEqual(pass1[:len(first)].raw_data, first.raw_data)
             # Each pass's tracks end at that pass's last audio (row 4's longer pass 1 take).
-            self.assertEqual(len(pass1), 5000 + 1050 + 150 + 200)   # row 4 at 5.0 s: lead, speech, tail
+            self.assertEqual(len(pass1), 5000 + 1050 + 200)   # row 4 at 5.0 s: speech, tail (lead trimmed)
+
+    def test_trim_leading_silence_cuts_only_the_blank_start(self):
+        from v2.audio_speed import trim_leading_silence
+        trimmed, removed = trim_leading_silence(self.spoken_clip(1000, lead_ms=180, tail_ms=200))
+        self.assertEqual(removed, 180)
+        self.assertEqual(speech_span(trimmed), (0, 1000, 1200))           # speech and tail untouched
+        clip = wav_bytes(300)                                               # already starts with sound
+        self.assertEqual(trim_leading_silence(clip)[1], 0)
+        blank = wav_bytes(500, value=0)                                     # all blank: left as delivered
+        self.assertEqual(trim_leading_silence(blank), (blank, 0))
 
     def test_file_names_are_lowercase_with_an_episode_prefix(self):
         row = DialogueRow(12, "EP01", "ONSCREEN TEXT", 0, 1000, "Hi", "v")

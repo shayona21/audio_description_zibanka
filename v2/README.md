@@ -20,6 +20,8 @@ v2/.venv/bin/python -m v2.app
 
 Open http://127.0.0.1:5071. The original application can continue on port 5070. V2 reads its API key and port from its own `.env` plus environment variables. Model selection is defined only by `MODEL_ID` in `v2/tts_client.py`; environment variables and constructor arguments cannot override it. Every request includes the `VOICE_SETTINGS` from that file: stability 0.5 and similarity boost 0.75. English dialogue is sent verbatim; no translation is performed. The API integration follows the [ElevenLabs create speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
 
+**Every take starts on its first sound.** ElevenLabs puts a short, variable stretch of blank audio before the voice (measured 20–180 ms on Billionaire Bhakri episode 1), which made speech start after TCR IN and broke lipsync. Right after each ElevenLabs request, FFmpeg's `silenceremove` finds the first sound (the first 10 ms louder than −60 dBFS; a breath or click counts as sound) and everything before it is cut, on a whole-millisecond boundary, leaving the speech samples untouched. The amount is printed per row and recorded in `processing_report.csv` (`leading_trim_ms`). Trailing silence is kept. Quality Check trims regenerated lines the same way. `measure_leading_silence.py` measures the blank on any run ZIP; on a run made after this change it should report about 0 ms.
+
 **Pass 2 fits every line to its slot.** After ElevenLabs (pass 1), the spoken part of each clip is measured (the silence ElevenLabs adds before and after the voice is not counted) and compared with the slot, TCR OUT − TCR IN. A line more than 0.10 s off is time-stretched with FFmpeg's `atempo` by spoken ÷ slot, keeping the voice's pitch: too-long lines are sped up and too-short lines slowed down, held between **0.70x and 1.50x**. No second ElevenLabs request is made. FFmpeg must be on PATH; a missing FFmpeg is reported before any speech is generated. Each line's speed is recorded in `processing_report.csv` (`fit_speed`). Pass 2 replaces the earlier 1.00x–1.20x speed dial. The ZIP holds both passes, so pass 1 and pass 2 can be compared line by line and track by track.
 
 ## Spreadsheet contract
@@ -49,7 +51,7 @@ The ZIP contains:
 
 | Path | Contents |
 | --- | --- |
-| `pass1/lines/ep<episode>_<character>_row<excel row>.wav` | Pass 1: each dubbed row (rows with a VOICE ID) as ElevenLabs delivered it |
+| `pass1/lines/ep<episode>_<character>_row<excel row>.wav` | Pass 1: each dubbed row (rows with a VOICE ID) as ElevenLabs delivered it, with the leading blank audio trimmed |
 | `pass1/tracks/ep<episode>_<character>.wav` | Pass 1: one full-length timeline per episode and character, built from the pass 1 lines |
 | `pass2/lines/ep<episode>_<character>_row<excel row>.wav` | Pass 2: the same rows fitted to their slots (the audio delivered) |
 | `pass2/tracks/ep<episode>_<character>.wav` | Pass 2: one full-length timeline per episode and character, built from the pass 2 lines |
@@ -68,13 +70,14 @@ All tracks for an episode start at zero and have the same length: the latest ori
 `processing_report.csv` uses this exact column order:
 
 ```text
-excel_row,episode,character,voice_id,start_TCR,end_TCR,duration,pass1_duration_ms,pass1_overrun_ms,fit_speed,pass2_duration_ms,pass2_overrun_ms,status,track,adjusted_start_TCR,adjusted_end_TCR
+excel_row,episode,character,voice_id,start_TCR,end_TCR,duration,leading_trim_ms,pass1_duration_ms,pass1_overrun_ms,fit_speed,pass2_duration_ms,pass2_overrun_ms,status,track,adjusted_start_TCR,adjusted_end_TCR
 ```
 
 - `excel_row` identifies the original Excel row; records retain source row order across episodes.
 - `start_TCR` and `end_TCR` show the original script times as `HH:MM:SS:FF` at the selected frame rate.
 - `duration` is the original scripted end minus start, **in milliseconds**.
-- `pass1_duration_ms` is the length of ElevenLabs' clip as delivered; `pass1_overrun_ms` is `max(0, pass1_duration_ms − duration)`.
+- `leading_trim_ms` is how much blank audio was cut from the start of ElevenLabs' clip.
+- `pass1_duration_ms` is the length of ElevenLabs' clip after that trim; `pass1_overrun_ms` is `max(0, pass1_duration_ms − duration)`.
 - `fit_speed` is the speed pass 2 applied to the line, e.g. `1.16` (`1.00` when the line already fitted).
 - `pass2_duration_ms` is the measured audio length **after pass 2**; `pass2_overrun_ms` is `max(0, pass2_duration_ms − duration)`. Overruns do not include delays caused by that character's earlier dialogue.
 - `adjusted_start_TCR` and `adjusted_end_TCR` show the actual placement and speech end.

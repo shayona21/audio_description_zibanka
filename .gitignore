@@ -6,3 +6,5 @@ __pycache__/
 output/
 *.wav
 *.mp3
+.DS_Store
+v2/silence_trim_test/
