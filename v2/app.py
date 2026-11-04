@@ -18,6 +18,7 @@ from .excel_parser import SUPPORTED_FPS, TEMPLATE_HEADERS, parse_excel
 from .audio_speed import check_ffmpeg
 from .exporter import safe_component
 from .pipeline import run_pipeline
+from .rewrite import GeminiRewriter
 from .tts_client import ElevenLabsClient
 
 
@@ -178,6 +179,9 @@ def create_app(config=None):
             synthesize = app.config.get("SYNTHESIZE")
             if synthesize is None:
                 synthesize = ElevenLabsClient()
+            rewrite = app.config.get("REWRITE")
+            if rewrite is None:
+                rewrite = GeminiRewriter()   # pass 1.5; a missing GEMINI_API_KEY is reported before any request
         except ValueError as exc:
             upload_path.unlink(missing_ok=True)
             job_dir.rmdir()
@@ -194,11 +198,13 @@ def create_app(config=None):
         def process():
             try:
                 summary = run_pipeline(upload_path, job_dir / "AD_v2_output.zip",
-                                       fps=fps, sheet_name=sheet_name, synthesize=synthesize,
+                                       fps=fps, sheet_name=sheet_name, synthesize=synthesize, rewrite=rewrite,
                                        progress=jobs[job_id]["progress"].append,
                                        progress_state=lambda state: jobs[job_id].update(state))
-                jobs[job_id].update(flagged_rows=summary["flagged_rows"], fitted_rows=summary["fitted_rows"],
-                                    status="done", percent=100, phase="Complete")
+                jobs[job_id].update({key: summary[key] for key in (
+                                        "flagged_rows", "fitted_rows", "rewritten_rows", "manual_review_rows",
+                                        "overrun_rows", "success_percent", "success")})
+                jobs[job_id].update(status="done", percent=100, phase="Complete")
                 write_run_record(job_dir, dict(record, status="done", finished=time.time(),
                                                episodes=sorted({row.episode for row in rows})))
             except Exception as exc:

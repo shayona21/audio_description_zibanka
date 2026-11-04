@@ -57,7 +57,25 @@ SECOND_EPISODE = [
 ]
 
 
-def dub_zip(tmp, rows, name="dub.zip", fps=25):
+def fitting_rewrite(request):
+    """Stand-in for Gemini: keeps the [tags] and resizes the words so the fake voice (45 ms per
+    character) lasts about the slot."""
+    from v2.rewrite import TAG_PATTERN, tags
+    head = " ".join(tags(request.text))
+    words = " ".join(TAG_PATTERN.sub("", request.text).split()) or "line"
+    size = max(1, round(len(request.text) * request.target_ms / request.duration_ms) - len(head) - 1)
+    spoken = (words + " ") * (size // (len(words) + 1) + 1)
+    spoken = spoken[:size].strip() or words[:1]
+    return f"{head} {spoken}".strip()
+
+
+def no_rewrite(_request):
+    """Gemini unavailable: AD Tool V2 keeps every take and flags long and short lines for review,
+    which is what this tool's own Generate does."""
+    raise RuntimeError("Gemini unavailable in this test")
+
+
+def dub_zip(tmp, rows, name="dub.zip", fps=25, rewrite=fitting_rewrite):
     """Run the real V2 pipeline (needs pydub and FFmpeg) and return the output ZIP's bytes."""
     from v2.pipeline import run_pipeline
 
@@ -65,7 +83,7 @@ def dub_zip(tmp, rows, name="dub.zip", fps=25):
     script = tmp / f"{name}.xlsx"
     script.write_bytes(workbook_bytes(rows))
     out = tmp / name
-    run_pipeline(script, out, fps=fps, synthesize=fake_voice, progress=lambda _m: None)
+    run_pipeline(script, out, fps=fps, synthesize=fake_voice, rewrite=rewrite, progress=lambda _m: None)
     return out.read_bytes()
 
 

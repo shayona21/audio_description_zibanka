@@ -1,15 +1,27 @@
-"""Leading-silence trim (every take) and pass 2: fit each dubbed line to its slot by changing its speed with FFmpeg (pitch preserved).
+"""Leading-silence trim, line measurements, and pass 2 (FFmpeg speed, pitch preserved).
 
-After ElevenLabs (pass 1), the spoken part of each clip is measured (silence ElevenLabs adds before and
-after the voice is not counted) and compared with the scripted slot, TCR OUT - TCR IN. A line more
-than FIT_TOLERANCE_MS off is time-stretched by spoken / slot with FFmpeg's ``atempo``, held between
-MIN_FIT_SPEED and MAX_FIT_SPEED: too-long lines are sped up, too-short lines are slowed down. No
-second ElevenLabs request is made, so the performance is the same take.
+Every take has its leading silence trimmed, then is measured against its slot (TCR OUT - TCR IN):
+
+  audio_duration   the meter: from the first sound to the end of the spoken part (trailing silence
+                   is not counted). The take is already trimmed, so it starts on its first sound.
+  overrun_ms       audio_duration - tcr_duration; negative when the line is too short
+  percent_overrun  overrun_ms / tcr_duration * 100
+  desired_speed    audio_duration / tcr_duration, no limits
+
+Speeds and percentages are kept to SIG_FIGS significant figures.
+
+  normal row       |percent_overrun| <= NORMAL_TOLERANCE_PERCENT: no speed change in any pass
+  needs rewrite    desired_speed outside MIN_SPEED..MAX_SPEED: pass 1.5 rewrites it with Gemini
+  pass 2           normal rows and rows flagged for manual review stay at 1.0x; every other row
+                   gets its desired speed, held between MIN_SPEED and MAX_SPEED
+  within target    percent_overrun <= NORMAL_TOLERANCE_PERCENT (too-short lines count as within)
+  success          at least SUCCESS_TARGET_PERCENT of rows within target after pass 2
 
 Also used by the Dubbing Quality Check for its per-line speed control.
 """
 
 from array import array
+from dataclasses import dataclass
 import io
 import math
 import shutil
@@ -17,9 +29,15 @@ import subprocess
 import sys
 import wave
 
-MIN_FIT_SPEED = 0.70
-MAX_FIT_SPEED = 1.50
-FIT_TOLERANCE_MS = 100     # a line this close to its slot keeps its natural speed
+# Universal speed limits: pass 1.5 rewrites lines outside them, pass 2 never goes beyond them.
+MIN_SPEED = 0.80
+MAX_SPEED = 1.20
+NORMAL_TOLERANCE_PERCENT = 2       # within +/- 2% of the slot: a normal row
+SUCCESS_TARGET_PERCENT = 90        # share of rows that must be within target after pass 2
+SIG_FIGS = 8
+
+MIN_FIT_SPEED, MAX_FIT_SPEED = MIN_SPEED, MAX_SPEED   # older names, still used by Quality Check
+
 SPEECH_WINDOW_MS = 10      # speech detection resolution
 SILENCE_DB = 40            # quieter than this below the clip's loudest point counts as silence
 MIN_SPEECH_PEAK = 64       # and never above this absolute level (about -54 dBFS)
@@ -129,28 +147,100 @@ def speech_span(wav_bytes):
     return voiced[0] * SPEECH_WINDOW_MS, min(clip_ms, (voiced[-1] + 1) * SPEECH_WINDOW_MS), clip_ms
 
 
-def needed_speed(wav_bytes, slot_ms):
-    """The speed at which the spoken part lasts ``slot_ms``, with no limits or rounding; 1.0 when the
-    line is already within the tolerance (or silent). Quality Check shows it when a limit is reached."""
-    start, end, _clip = speech_span(wav_bytes)
-    spoken = end - start
-    if spoken <= 0 or slot_ms <= 0 or abs(slot_ms - spoken) <= FIT_TOLERANCE_MS:
-        return 1.0
-    return spoken / slot_ms
+# ---- measurements ------------------------------------------------------------------------------
+
+def sig(value):
+    """``value`` kept to SIG_FIGS significant figures."""
+    return float(f"{value:.{SIG_FIGS}g}")
+
+
+def format_sig(value):
+    """Report text with SIG_FIGS significant figures and its trailing zeros kept:
+    1.4523810, 93.181818, -2.0000000."""
+    return f"{value:#.{SIG_FIGS}g}".rstrip(".")   # '#' would leave a bare '.' on 8-digit whole numbers
+
+
+@dataclass(frozen=True)
+class Measurement:
+    tcr_duration_ms: int
+    audio_duration_ms: int
+
+    @property
+    def overrun_ms(self):
+        return self.audio_duration_ms - self.tcr_duration_ms
+
+    @property
+    def percent_overrun(self):
+        return sig(self.overrun_ms / self.tcr_duration_ms * 100)
+
+    @property
+    def desired_speed(self):
+        return sig(self.audio_duration_ms / self.tcr_duration_ms)
+
+    @property
+    def is_normal(self):
+        return abs(self.percent_overrun) <= NORMAL_TOLERANCE_PERCENT
+
+    @property
+    def needs_rewrite(self):
+        return not MIN_SPEED <= self.desired_speed <= MAX_SPEED
+
+    @property
+    def within_target(self):
+        return self.percent_overrun <= NORMAL_TOLERANCE_PERCENT
+
+
+def audio_duration(wav_bytes):
+    """The meter: first sound to the end of the spoken part, in ms. The take has had its leading
+    silence trimmed, so this is measured from the start of the clip; trailing silence is not counted."""
+    _start, end, _clip = speech_span(wav_bytes)
+    return end
+
+
+def measure(wav_bytes, tcr_duration_ms):
+    if tcr_duration_ms <= 0:
+        raise ValueError("TCR OUT must be later than TCR IN")
+    return Measurement(tcr_duration_ms, audio_duration(wav_bytes))
 
 
 def limit_speed(speed):
-    """Hold a needed speed between the limits, rounded to 0.01x."""
-    return round(min(MAX_FIT_SPEED, max(MIN_FIT_SPEED, speed)), 2)
+    """Hold a speed between MIN_SPEED and MAX_SPEED."""
+    return min(MAX_SPEED, max(MIN_SPEED, speed))
+
+
+def pass2_speed(measurement, manual_review=False):
+    """1.0 for normal rows, rows flagged for manual review and silent takes; otherwise the desired
+    speed, held between the limits."""
+    if manual_review or measurement.is_normal or measurement.audio_duration_ms == 0:
+        return 1.0
+    return limit_speed(measurement.desired_speed)
+
+
+def apply_pass2(wav_bytes, measurement, manual_review=False):
+    """Pass 2 for one line: ``(fitted wav, speed applied)``."""
+    speed = pass2_speed(measurement, manual_review)
+    return change_speed(wav_bytes, speed), speed
+
+
+def success_rate(measurements):
+    """``(percent of rows within target, met SUCCESS_TARGET_PERCENT)`` for the pass 2 measurements."""
+    measurements = list(measurements)
+    if not measurements:
+        return 100.0, True
+    percent = sig(sum(m.within_target for m in measurements) / len(measurements) * 100)
+    return percent, percent >= SUCCESS_TARGET_PERCENT
+
+
+# Shorthands kept for Quality Check, which works from a clip and its slot.
+def needed_speed(wav_bytes, slot_ms):
+    """The desired speed, no limits."""
+    return measure(wav_bytes, slot_ms).desired_speed
 
 
 def fit_speed(wav_bytes, slot_ms):
-    """The speed that makes the spoken part last ``slot_ms``: spoken / slot, held between the limits,
-    rounded to 0.01x; 1.00 when the line is already within the tolerance (or silent)."""
-    return limit_speed(needed_speed(wav_bytes, slot_ms))
+    """The speed pass 2 would apply to this clip."""
+    return pass2_speed(measure(wav_bytes, slot_ms))
 
 
 def fit_to_slot(wav_bytes, slot_ms):
-    """Pass 2 for one line: ``(fitted wav, speed applied)``."""
-    speed = fit_speed(wav_bytes, slot_ms)
-    return change_speed(wav_bytes, speed), speed
+    return apply_pass2(wav_bytes, measure(wav_bytes, slot_ms))

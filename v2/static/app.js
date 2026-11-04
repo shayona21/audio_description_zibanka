@@ -129,8 +129,8 @@ async function pollStatus() {
         const data = await readResponse(await fetch(`/status/${activeJob}`));
         const lines = data.progress || [];
         lines.slice(lastLogCount).forEach(line => {
-            appendLog(line, line.startsWith('Complete') ? 'done'
-                : line.startsWith('Review') ? 'warning' : '');
+            appendLog(line, line.startsWith('Complete') || line.startsWith('Success') ? 'done'
+                : line.startsWith('WARNING') || line.includes('manual review') ? 'warning' : '');
         });
         lastLogCount = lines.length;
         setProgress(data.percent);
@@ -139,7 +139,7 @@ async function pollStatus() {
             setProgress(100);
             byId('download-link').href = `/download/${activeJob}`;
             byId('output-file-name').textContent = data.download_name || 'AD_v2_output.zip';
-            byId('review-summary').textContent = `${data.tracks} tracks · ${data.fitted_rows} rows fitted to their slot · ${data.flagged_rows} rows flagged for timing review`;
+            byId('review-summary').textContent = `${data.success_percent}% of rows within target ${data.success ? '✅' : '❌'} · ${data.tracks} tracks · ${data.rewritten_rows} rows rewritten · ${data.fitted_rows} rows sped up or slowed down · ${data.manual_review_rows} rows for manual review · ${data.overrun_rows} rows over TCR OUT`;
             downloadSection.style.display = 'block';
             rememberJob(null);
             activeJob = null;

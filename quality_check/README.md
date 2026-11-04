@@ -37,8 +37,8 @@ Open http://127.0.0.1:5072. AD version 2 can keep running on 5071.
 | AD Tool V2 run (Use AD Tool V2 audio) | 500 MB | A finished run listed from `v2/runtime`, or the ZIP AD Tool V2 delivered. Any number of episodes; pick one. |
 | Video | 500 MB | `.mp4` (H.264) plays everywhere; `.mov` often does not. Must start at `00:00:00:00`. |
 
-Settings (under "Change"): timecode frame rate and worksheet name. A run on this server brings its
-own; for an uploaded ZIP they are a hint (the frame rate is found from the run's report).
+Settings (under "Change", Generate only): timecode frame rate and worksheet name. An AD Tool V2 run
+needs no settings: its report carries its own frame rate and timings.
 
 FFmpeg must be installed on the server: Generate fits every line with it, and line speed uses it.
 
@@ -47,10 +47,12 @@ The ElevenLabs key is read from `quality_check/.env`, or from `v2/.env` if this 
 ## How the dub is made (Block 2)
 
 `dubbing.py` runs AD version 2's pipeline step for step, calling the `v2` modules directly:
-`ElevenLabsClient` for each row (VOICE ID and audio tags from the Excel), pass 2 (each line fitted to
-its slot with FFmpeg, 0.70x to 1.50x, `v2/audio_speed.py`), `place_dialogue` for collisions,
-`build_track` per character. The character tracks are byte-identical to AD version 2's output for
-the same script (a test checks this).
+`ElevenLabsClient` for each row (VOICE ID and audio tags from the Excel), pass 2 (FFmpeg between
+0.80x and 1.20x; nothing for a line within 2% of its slot; `v2/audio_speed.py`), `place_dialogue` for
+collisions, `build_track` per character. It does not call Gemini: a line that would need more than
+the limits stays at 1.00x and is marked for manual review, for the reviewer to rewrite here. The
+character tracks are byte-identical to AD version 2's output for the same script when Gemini is not
+used (a test checks this).
 
 - **Every line is kept**: `clips/<excel row>.take.wav` is ElevenLabs' take as delivered and
   `clips/<excel row>.wav` is what plays (the take at its speed), so Block 5 can regenerate one line
@@ -70,15 +72,18 @@ here, newest first (30 at most). If AD Tool V2 runs from a different folder than
 `AD_V2_RUNTIME_DIR` to its `v2/runtime` folder. A run made elsewhere can be uploaded as its ZIP instead (kept 24
 hours). After picking the run and the episode:
 
-- The episode's clips are taken from the ZIP's `pass1/lines/` and `pass2/lines/` folders
-  (`ep<episode>_<character>_row<row>.wav`, the names from `v2.exporter.line_name`) and its rows from
-  the ZIP's `script.xlsx`. Pass 1 becomes each line's take and pass 2 is what plays. Every clip is
-  checked first; a missing one is reported by Excel row before anything is stored.
-- The character tracks are rebuilt from the pass 2 clips with V2's rule, so they are sample-identical
-  to `pass2/tracks/` in the ZIP (a test checks this) and one line can later be changed on its own.
-- Each line's fit speed comes from the ZIP's `processing_report.csv`. An uploaded ZIP's frame rate is
-  found by matching the report's scripted durations against the workbook.
-- ZIPs from an earlier AD Tool V2 (without `pass1/` and `pass2/` line clips) are refused with a
+- Only two things in the ZIP are read: `processing_report.csv` and `pass1_5/lines/`
+  (`ep<episode>_<character>_row<row>.wav`, the names from `v2.exporter.line_name`). The report gives
+  each row's timing in milliseconds, frame rate, character, voice, script wording, the dialogue spoken
+  and the pass 2 speed, so the workbook is not parsed and no frame rate or worksheet is asked for.
+  Every clip is checked first; a missing one is reported by Excel row before anything is stored.
+- Each pass 1.5 clip becomes the line's take; what plays is that take at the report's pass 2 speed
+  (the same FFmpeg call AD Tool V2 made, so V2's pass 2 audio exactly). The tracks are rebuilt from
+  these clips with V2's rule, sample-identical to `pass2/tracks/` (a test checks this).
+- Lines Gemini rewrote show as edited lines, with the script's wording beside them. Lines AD Tool V2
+  marked `MANUAL_REVIEW` keep its note, and the review lists how many there are.
+- The ZIP's `script.xlsx` is kept only so the export can write changed lines back into it.
+- ZIPs from an earlier AD Tool V2 (no `pass1_5/lines/`, or an older report) are refused with a
   message to run the script again.
 - Editing a line's words still makes one ElevenLabs request for that line, fitted like the rest.
 ## Script panel and subtitles (Block 4)
@@ -109,19 +114,20 @@ hours). After picking the run and the episode:
 
 ## Line speed
 
-Every line starts at its **fit speed**: pass 2's speed (spoken length / slot, 0.70x to 1.50x, 1.00x
-within 0.10 s), from FFmpeg here or from AD Tool V2's report. Lines not at 1.00x show a green badge
+Every line starts at its **fit speed**: pass 2's speed (spoken length / slot, 0.80x to 1.20x, 1.00x
+within 2% of the slot, and 1.00x for lines marked for manual review), from FFmpeg here or from AD
+Tool V2's report. Lines not at 1.00x show a green badge
 such as `1.30x`.
 
 Next to Video sound and Dub sound, **Line speed** sets the speed of the line selected in the script,
-from 0.70x to 1.50x (pitch preserved, FFmpeg). Speeds are always relative to ElevenLabs' natural
-delivery and applied to the line's take (pass 1), so changes never stack: 1.00x is the natural take
+from 0.80x to 1.20x (pitch preserved, FFmpeg). Speeds are always relative to the line's take
+(before any speed change), so changes never stack: 1.00x is the natural take
 and the fit speed gives the pass 2 clip back exactly. The line keeps its start time; only that character's track is rebuilt and no
 ElevenLabs request is made. A speed set in review shows a blue badge. Regenerating a line gives a
 new take at its own fit speed.
 
 Beside the slider, **Suggested speed** shows the selected line's fit speed, computed on the server
-from the take's spoken length. It is shown in amber when even the 0.70x or 1.50x limit does not make
+from the take's spoken length. It is shown in amber when even the 0.80x or 1.20x limit does not make
 the line fit. It never changes the audio; the reviewer decides whether to use the slider.
 
 ## Export (Block 6)
@@ -133,9 +139,9 @@ the line fit. It never changes the audio; the reviewer decides whether to use th
 | --- | --- |
 | `ep<ep>_<character>.wav` | One per character, exactly as heard in the review (edits and line speeds included) |
 | `ep<ep>_timeline.csv` | AD version 2's combined timeline, recomputed for the reviewed audio |
-| `processing_report.csv` | AD version 2's report columns: `pass1_` columns are each line's take (ElevenLabs as delivered), `fit_speed` and `pass2_` columns the audio as reviewed |
-| `<script>_qc.xlsx` | The workbook (uploaded, or the run's `script.xlsx`) with edited lines written into TARGET DIALOGUE. Changed cells are highlighted and carry a note with the script wording (and any speed set in review). Nothing else in the workbook changes. |
-| `qc_changes.csv` | One row per line changed in review: Excel row, character, TCR IN, script wording, reviewed wording, line speed set in review (empty if only the words changed) |
+| `processing_report.csv` | AD version 2's report columns: `pass1_` is V2's first take (imported runs) or the take generated here, `pass1_5_` the line's take, `pass2_speed` and `pass2_` the audio as reviewed |
+| `<script>_qc.xlsx` | The workbook (uploaded, or the run's `script.xlsx`) with changed lines written into TARGET DIALOGUE: Gemini's rewrites and the reviewer's edits. Changed cells are highlighted and carry a note with the script wording (and "Rewritten by Gemini", or any speed set in review). Nothing else in the workbook changes. |
+| `qc_changes.csv` | One row per changed line: Excel row, character, TCR IN, changed by (Gemini or reviewer), script wording, final wording, line speed set in review (empty if only the words changed) |
 
 The session stays open after exporting, so the reviewer can keep working and export again.
 

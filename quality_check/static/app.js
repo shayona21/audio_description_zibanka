@@ -127,8 +127,7 @@ function settingsForm(form) {
 
 function recheckScript() {
     if (state.script.file) checkScript(state.script.file);
-    // An uploaded ZIP is read with the settings (its frame rate is found from its report anyway).
-    if (state.run.id && state.run.id.startsWith('up-') && state.run.status !== 'checking') readRun(state.run.id);
+    // An AD Tool V2 run carries its own frame rate and timings, so the settings never apply to it.
 }
 
 async function checkScript(file) {
@@ -174,6 +173,9 @@ function setSource(source) {
         btn.setAttribute('aria-checked', String(btn.dataset.source === source)));
     $('script-slot').hidden = source !== 'generate';
     $('run-slot').hidden = source !== 'v2';
+    // Frame rate and worksheet only matter for a script dubbed here; a run's report has its own.
+    document.querySelector('.options-summary').hidden = source !== 'generate';
+    if (source !== 'generate') $('settings').hidden = true;
     $('form-error').hidden = true;
     if (source === 'v2' && state.runs.status !== 'loading') loadRuns();
     render();
@@ -229,10 +231,9 @@ async function readRun(id) {
     const check = ++run.check;
     Object.assign(run, { id, status: 'checking', details: null, error: '' });
     render();
-    const query = new URLSearchParams({ fps: $('fps').value, sheet: $('sheet-name').value });
     let result;
     try {
-        const response = await fetch(`/v2-runs/${id}?${query}`, { cache: 'no-store' });
+        const response = await fetch(`/v2-runs/${id}`, { cache: 'no-store' });
         const body = await response.json().catch(() => ({}));
         result = response.ok ? { details: body } : { error: body.error || `The server could not read this run (HTTP ${response.status}).` };
     } catch (_) {
@@ -272,7 +273,7 @@ function uploadRun(file) {
     }
     run.status = 'checking';
     render();
-    const form = settingsForm(new FormData());
+    const form = new FormData();
     form.append('dub', file);
     const job = send('/v2-runs', form, (loaded, total) => {
         if (check === run.check) $('run-progress').style.width = `${Math.round(loaded / total * 100)}%`;

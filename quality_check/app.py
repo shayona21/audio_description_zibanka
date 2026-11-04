@@ -14,7 +14,7 @@ generated here with ElevenLabs (as AD version 2 does), or taken from an AD versi
   GET  /session/<id>              record plus live dubbing progress (polled by the page)
   POST /session/<id>/retry        after an error, resume (generated: from the failed line)
   POST /session/<id>/lines/<row>  edit a line's text and re-dub it; only changed tracks are rebuilt
-  POST /session/<id>/lines/<row>/speed   set one line's speed (0.70x to 1.50x) from its take
+  POST /session/<id>/lines/<row>/speed   set one line's speed (0.80x to 1.20x) from its take
   GET  /session/<id>/export       download the reviewed episode (AD version 2 layout + edited Excel)
   GET  /session/<id>/video | tracks/<n>.wav | peaks.json    media for the review screen
   DELETE /session/<id>            stop dubbing and remove the session
@@ -36,9 +36,10 @@ from dotenv import dotenv_values
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
 from v2.app import start_cleanup_thread   # same hourly cleanup loop as AD version 2
-from v2.audio_speed import MAX_FIT_SPEED, MIN_FIT_SPEED, check_ffmpeg, validate_speed
+from v2.audio_speed import MAX_FIT_SPEED, MIN_FIT_SPEED, check_ffmpeg, sig, validate_speed
 from v2.excel_parser import SUPPORTED_FPS, parse_excel
 from v2.exporter import episode_tag
+from v2.models import DialogueRow
 from v2.tts_client import ElevenLabsClient
 
 from .dubbing import (DubCancelled, DubError, assemble, clip_lengths, dub_episode, import_clips, regenerate_line,
@@ -56,6 +57,7 @@ VIDEO_TYPES = {".mp4": "video/mp4", ".m4v": "video/mp4",
 SESSION_MAX_AGE_SECONDS = 24 * 60 * 60
 SESSION_ID = re.compile(r"[0-9a-f]{32}")
 RUN_ID = re.compile(r"(up-)?[0-9a-f]{32}")  # an AD version 2 job id, or "up-" + an uploaded ZIP's id
+ROWS_FILE = "rows.json"                     # an imported run's rows, taken from its report
 V2_OUTPUT = "AD_v2_output.zip"              # V2 writes each run's ZIP under this name in its job folder
 MAX_LISTED_RUNS = 30
 MAX_LINE_CHARS = 1500
@@ -141,11 +143,22 @@ def create_app(config=None):
                 key = str(line["row"])
                 take = take_info(record, key)
                 lines.append(dict(line, edited=key in edits, original=edits.get(key, {}).get("original"),
+                                  edited_by=edits.get(key, {}).get("by", "reviewer") if key in edits else None,
+                                  status=take.get("status") or "", note=take.get("note") or "",
                                   fit_speed=take["fit_speed"], needed_speed=take["needed_speed"],
                                   line_speed=line_speed_of(record, key),
                                   speed_set=key in (record.get("line_speeds") or {})))
+            flagged = sum(line["status"] == "MANUAL_REVIEW" for line in lines)
+            rewritten = sum(line["edited_by"] == "gemini" for line in lines)
+            warnings = list(record["audio"]["warnings"])
+            if flagged:
+                warnings.append(f"{flagged} line{'s need' if flagged != 1 else ' needs'} manual review: "
+                                "even the speed limits do not fit them to their slot.")
+            if rewritten:
+                warnings.append(f"{rewritten} line{'s were' if rewritten != 1 else ' was'} rewritten by Gemini "
+                                "in AD Tool V2 to fit its slot; the script's wording is shown beside each.")
             out["audio"] = dict(
-                record["audio"], lines=lines,
+                record["audio"], lines=lines, warnings=warnings,
                 tracks=[dict(t, url=f"/session/{sid}/tracks/{t['index']}.wav") for t in record["audio"]["tracks"]])
         return out
 
@@ -250,25 +263,23 @@ def create_app(config=None):
         except (OSError, ValueError):
             return None
 
-    def open_run(run_id, fps, sheet_name):
-        """The run, read at its own frame rate and worksheet (an upload: the settings' as a hint)."""
+    def open_run(run_id):
+        """The run, read from its report: it carries its own frame rate and timings."""
         path, details = run_zip(run_id)
-        if not run_id.startswith("up-"):
-            fps, sheet_name = details.get("fps", fps), details.get("sheet")
         try:
-            return V2Run(path, fps, sheet_name), details
+            return V2Run(path), details
         except RunError as exc:
             raise UploadError(str(exc)) from None
 
-    def describe_run(run_id, fps, sheet_name):
-        run, details = open_run(run_id, fps, sheet_name)
+    def describe_run(run_id):
+        run, details = open_run(run_id)
         with run:
             try:
                 episodes = [summarize_episode(run.episode_rows(ep), run.fps) for ep in run.episodes()]
             except ValueError as exc:
                 raise UploadError(str(exc)) from None
         return {"id": run_id, "name": details.get("download_name") or details.get("name"),
-                "fps": run.fps, "sheet": run.sheet, "episodes": episodes}
+                "fps": run.fps, "episodes": episodes}
 
     # ------------------------------------------------------------------ line speeds
     def take_info(record, key):
@@ -295,9 +306,14 @@ def create_app(config=None):
             session_lock.release()
 
     def episode_rows(record):
-        """Script rows with the reviewer's text edits applied (the Excel itself is never changed)."""
-        rows, summary = parse_script(runtime / record["session_id"] / "script.xlsx", record["fps"], record["sheet"],
-                                     record.get("episode"))
+        """Script rows with the text edits applied (the Excel itself is never changed). An imported
+        run's rows were taken from its report and saved with the session."""
+        folder = runtime / record["session_id"]
+        if (folder / ROWS_FILE).is_file():
+            rows = [DialogueRow(**row) for row in json.loads((folder / ROWS_FILE).read_text(encoding="utf-8"))]
+            summary = summarize_episode(rows, record["fps"])
+        else:
+            rows, summary = parse_script(folder / "script.xlsx", record["fps"], record["sheet"], record.get("episode"))
         edits = record.get("edits") or {}
         rows = [replace(row, text=edits[str(row.row_number)]["text"]) if str(row.row_number) in edits else row
                 for row in rows]
@@ -378,8 +394,7 @@ def create_app(config=None):
 
     @app.get("/v2-runs/<run_id>")
     def run_details(run_id):
-        fps, sheet_name = read_settings(request.args)
-        return jsonify(describe_run(run_id, fps, sheet_name))
+        return jsonify(describe_run(run_id))
 
     @app.post("/v2-runs")
     def upload_run():
@@ -387,7 +402,6 @@ def create_app(config=None):
         upload = request.files.get("dub")
         if upload is None or Path(upload.filename or "").suffix.lower() != ".zip":
             raise UploadError("Choose the ZIP that AD Tool V2 delivered (.zip).")
-        fps, sheet_name = read_settings()
         remove_old_sessions()
         uploads.mkdir(parents=True, exist_ok=True)
         token = uuid.uuid4().hex
@@ -396,7 +410,7 @@ def create_app(config=None):
             size = save_limited(upload, path, MAX_RUN_ZIP_BYTES, "ZIP")
             path.with_suffix(".json").write_text(json.dumps({"name": Path(upload.filename).name,
                                                              "size": human_size(size)}), encoding="utf-8")
-            info = describe_run(f"up-{token}", fps, sheet_name)
+            info = describe_run(f"up-{token}")
         except BaseException:
             path.unlink(missing_ok=True)
             path.with_suffix(".json").unlink(missing_ok=True)
@@ -435,10 +449,9 @@ def create_app(config=None):
         return jsonify(public(record)), 201
 
     def create_import_session():
-        """One episode of an AD version 2 run: its fitted clips become the takes, no ElevenLabs."""
-        fps, sheet_name = read_settings()
+        """One episode of an AD version 2 run: its takes and speeds come from the run, no ElevenLabs."""
         run_id, episode = request.form.get("run", ""), request.form.get("episode", "")
-        run, details = open_run(run_id, fps, sheet_name)
+        run, details = open_run(run_id)
         remove_old_sessions()
         session_id = uuid.uuid4().hex
         folder = runtime / session_id
@@ -446,23 +459,30 @@ def create_app(config=None):
             try:
                 rows = run.episode_rows(episode)
                 summary = summarize_episode(rows, run.fps)
-                clips, fits = run.clips(rows), run.fits(rows)
+                clips, takes, edits = run.clips(rows), run.takes(rows), run.rewrites(rows)
             except ValueError as exc:  # RunError and EpisodeError
                 raise UploadError(str(exc)) from None
             folder.mkdir(parents=True)
             try:
+                (folder / ROWS_FILE).write_text(json.dumps([row.__dict__ for row in rows]), encoding="utf-8")
                 run.save_script(folder / "script.xlsx")
-                takes = import_clips(folder, rows, clips, fits)
+                # Placement and tracks use the dialogue spoken: Gemini's rewrites are applied as edits.
+                spoken = [replace(row, text=edits[str(row.row_number)]["text"]) if str(row.row_number) in edits
+                          else row for row in rows]
+                import_clips(folder, spoken, clips, takes, run.fps)
                 name = details.get("download_name") or details.get("name") or V2_OUTPUT
                 record = {"session_id": session_id, "status": "dubbing", "created": time.time(), "source": "v2",
                           "run": {"id": run_id, "name": name}, "episode": episode,
-                          "fps": run.fps, "sheet": run.sheet,
+                          "fps": run.fps, "sheet": None,
                           "script": {"name": f"{Path(name).stem}_{episode_tag(episode)}.xlsx",
-                                     "size": human_size(len(run.script))},
+                                     "size": human_size(len(run.script or b""))},
                           "summary": summary, "audio": None, "video": None, "error": None, "failed_row": None,
-                          "takes": {str(row): info for row, info in takes.items()}, "edits": {}, "line_speeds": {}}
+                          "takes": {str(row): info for row, info in takes.items()}, "edits": edits, "line_speeds": {}}
                 save_record(record)
                 start_dubbing(session_id)
+            except DubError as exc:
+                shutil.rmtree(folder, ignore_errors=True)
+                raise UploadError(str(exc), 503) from None
             except BaseException:
                 shutil.rmtree(folder, ignore_errors=True)
                 raise
@@ -525,7 +545,7 @@ def create_app(config=None):
         session_dir(session_id)
         body = request.get_json(silent=True) or {}
         try:
-            speed = round(validate_speed(body.get("speed")), 2)
+            speed = sig(validate_speed(body.get("speed")))
         except ValueError as exc:
             raise UploadError(f"{exc}.") from None
         with line_change(session_id) as record:

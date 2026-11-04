@@ -3,12 +3,13 @@
 The ZIP holds:
   ep<ep>_<character>.wav         one per character, as reviewed (edits and line speeds included)
   ep<ep>_timeline.csv            V2's combined timeline, recomputed for the reviewed audio
-  processing_report.csv          V2's report, same columns. pass1_ is each line's take (ElevenLabs as
-                                 delivered); fit_speed and pass2_ are the audio as reviewed (pass 2's
-                                 fit or the reviewer's speed)
-  <script>_qc.xlsx               the uploaded workbook with edited lines written into TARGET DIALOGUE;
-                                 changed cells are highlighted and carry a note with the script wording
-  qc_changes.csv                 one row per line changed in review (text, line speed set by the reviewer)
+  processing_report.csv          V2's report, same columns. pass1_ is V2's first take (imported runs)
+                                 or the take generated here; pass1_5_ is the line's take; pass2_ is the
+                                 audio as reviewed (pass 2's speed or the reviewer's)
+  <script>_qc.xlsx               the workbook with changed lines written into TARGET DIALOGUE; changed
+                                 cells are highlighted and carry a note with the script wording
+  qc_changes.csv                 one row per changed line: Gemini's rewrites in AD Tool V2 and the
+                                 reviewer's text and speed changes
 
 File names and CSV formats come from ``v2.exporter`` so downstream steps can treat this ZIP like
 an AD version 2 output.
@@ -23,6 +24,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import PatternFill
 
 from v2.audio_builder import read_clip
+from v2.audio_speed import format_sig, measure
 from v2.exporter import (episode_tag, export_archive, format_tcr, safe_component, timeline_names, track_names,
                          write_csv, write_report, write_timeline)
 from v2.timing import place_dialogue
@@ -30,21 +32,31 @@ from v2.timing import place_dialogue
 from .dubbing import clip_path, take_path
 
 CHANGED_FILL = PatternFill("solid", fgColor="FFF2CC")  # Excel's pale yellow "changed" convention
-CHANGE_FIELDS = ("excel_row", "character", "start_TCR", "script_dialogue", "reviewed_dialogue", "line_speed")
+CHANGE_FIELDS = ("excel_row", "character", "start_TCR", "changed_by", "script_dialogue", "reviewed_dialogue",
+                 "line_speed")
+
+
+def headers_of(sheet):
+    return [" ".join(str(c.value or "").upper().split()) for c in sheet[1]]
 
 
 def edited_workbook(source, target, sheet_name, edits, speeds, fits):
-    """Copy the workbook, writing reviewed text into TARGET DIALOGUE. Nothing else is touched."""
+    """Copy the workbook, writing changed text into TARGET DIALOGUE. Nothing else is touched. Without
+    a worksheet name (an imported run), the first worksheet with a TARGET DIALOGUE header is used."""
     book = load_workbook(source)  # full mode: keeps formatting, other sheets and columns as they are
     try:
-        sheet = book[sheet_name] if sheet_name else book.worksheets[0]
-        headers = [" ".join(str(c.value or "").upper().split()) for c in sheet[1]]
-        column = headers.index("TARGET DIALOGUE") + 1
+        if sheet_name:
+            sheet = book[sheet_name]
+        else:
+            sheet = next((s for s in book.worksheets if "TARGET DIALOGUE" in headers_of(s)), book.worksheets[0])
+        column = headers_of(sheet).index("TARGET DIALOGUE") + 1
         for row_key in sorted(set(edits) | set(speeds), key=int):
             cell = sheet.cell(row=int(row_key), column=column)
             notes = []
             if row_key in edits:
                 cell.value = edits[row_key]["text"]
+                if edits[row_key].get("by") == "gemini":
+                    notes.append("Rewritten by Gemini in AD Tool V2 to fit its slot.")
                 notes.append(f"Script wording: {edits[row_key]['original']}")
             if row_key in speeds:
                 notes.append(f"Line speed set to {speeds[row_key]:.2f}x in quality check "
@@ -84,22 +96,34 @@ def build_export(folder, record, rows, out_path):
         files.append(timeline)
 
         records = []
+        takes = record.get("takes") or {}
         for p in placed:
             row = p.row
             key = str(row.row_number)
-            duration = p.end_ms - p.start_ms
-            scripted = row.end_ms - row.start_ms
-            overrun = max(0, duration - scripted)
+            slot = row.end_ms - row.start_ms
+            info = takes.get(key) or {}
             take = take_path(folder, row.row_number)
-            take_ms = len(read_clip(take.read_bytes())) if take.is_file() else None
+            line = measure((take if take.is_file() else clip_path(folder, row.row_number)).read_bytes(), slot)
+            played = measure(clip_path(folder, row.row_number).read_bytes(), slot)
+            measured_take = {f"pass1_5_{k}": v for k, v in fields(line).items()}
+            pass1 = info.get("pass1") or fields(line)   # generated here: the take is the first take
+            reviewed = key in speeds
+            status = ("MANUAL_REVIEW" if info.get("status") == "MANUAL_REVIEW" and not reviewed
+                      else "OK" if played.within_target else "TCR_OUT_OVERRUN")
+            original = edits[key]["original"] if key in edits else row.text
             records.append(dict(excel_row=row.row_number, episode=row.episode, character=row.character,
                                 voice_id=row.voice_id, start_TCR=format_tcr(row.start_ms, fps),
-                                end_TCR=format_tcr(row.end_ms, fps), duration=scripted,
-                                pass1_duration_ms=take_ms if take_ms is not None else "",
-                                pass1_overrun_ms=max(0, take_ms - scripted) if take_ms is not None else "",
-                                fit_speed=f"{speeds.get(key, fits.get(key, 1.0)):.2f}",
-                                pass2_duration_ms=duration, pass2_overrun_ms=overrun,
-                                status="TCR_OUT_OVERRUN" if overrun else "OK", track=names[row.group],
+                                end_TCR=format_tcr(row.end_ms, fps), fps=fps, start_ms=row.start_ms,
+                                end_ms=row.end_ms, tcr_duration_ms=slot, original_dialogue=original,
+                                final_dialogue=row.text, rewritten="yes" if row.text != original else "no",
+                                rewrite_attempts=info.get("rewrite_attempts", 0),
+                                leading_trim_ms=info.get("leading_trim_ms", ""),
+                                **{f"pass1_{k}": v for k, v in pass1.items()}, **measured_take,
+                                pass2_speed=format_sig(speeds.get(key, fits.get(key, 1.0))),
+                                pass2_audio_duration_ms=played.audio_duration_ms, pass2_overrun_ms=played.overrun_ms,
+                                pass2_percent_overrun=format_sig(played.percent_overrun),
+                                within_target="yes" if played.within_target else "no", status=status,
+                                note="" if reviewed else info.get("note", ""), track=names[row.group],
                                 adjusted_start_TCR=format_tcr(p.start_ms, fps),
                                 adjusted_end_TCR=format_tcr(p.end_ms, fps)))
         report = work / "processing_report.csv"
@@ -108,15 +132,21 @@ def build_export(folder, record, rows, out_path):
 
         stem = safe_component(Path(record["script"]["name"]).stem) or "script"
         workbook = work / f"{stem}_qc.xlsx"
-        edited_workbook(folder / "script.xlsx", workbook, record.get("sheet"), edits, speeds, fits)
-        files.append(workbook)
+        if (folder / "script.xlsx").is_file():
+            edited_workbook(folder / "script.xlsx", workbook, record.get("sheet"), edits, speeds, fits)
+            files.append(workbook)
 
         by_row = {row.row_number: row for row in rows}
         changes = []
         for key in sorted(set(edits) | set(speeds), key=int):
             row = by_row[int(key)]
+            by = []
+            if key in edits:
+                by.append("Gemini (AD Tool V2)" if edits[key].get("by") == "gemini" else "reviewer")
+            if key in speeds:
+                by.append("reviewer (speed)")
             changes.append({"excel_row": row.row_number, "character": row.character,
-                            "start_TCR": format_tcr(row.start_ms, fps),
+                            "start_TCR": format_tcr(row.start_ms, fps), "changed_by": ", ".join(by),
                             "script_dialogue": edits[key]["original"] if key in edits else row.text,
                             "reviewed_dialogue": row.text,
                             "line_speed": f"{speeds[key]:.2f}x" if key in speeds else ""})
@@ -128,3 +158,10 @@ def build_export(folder, record, rows, out_path):
         export_archive(out_path, files)
     return {"name": f"{episode_tag(episode)}_qc.zip", "changes": len(changes),
             "tracks": len(names), "workbook": workbook.name}
+
+
+def fields(measurement):
+    """A measurement as report values (speeds and percentages to 8 significant figures)."""
+    return {"audio_duration_ms": measurement.audio_duration_ms, "overrun_ms": measurement.overrun_ms,
+            "percent_overrun": format_sig(measurement.percent_overrun),
+            "desired_speed": format_sig(measurement.desired_speed)}

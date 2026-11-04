@@ -10,7 +10,8 @@ def safe_component(value):
 
 
 # ZIP layout. Quality Check reads these names when it imports a run, so keep both tools in step.
-PASS1_DIR = "pass1"            # ElevenLabs as delivered
+PASS1_DIR = "pass1"            # older runs only: no longer in the ZIP (Quality Check still reads it until updated)
+PASS1_5_DIR = "pass1_5"        # each trimmed take; rows rewritten by Gemini use the rewritten take
 PASS2_DIR = "pass2"            # each line fitted to its slot with FFmpeg (what is delivered)
 TRACKS_DIR = "tracks"          # in each pass: one full-length timeline WAV per <character, episode>
 LINES_DIR = "lines"            # in each pass: one WAV per dubbed row
@@ -47,11 +48,17 @@ def track_names(groups):
     return names
 
 
-# One record per row, pass 1 and pass 2 side by side. duration is the slot (TCR OUT - TCR IN) in ms;
-# status, track and the adjusted TCRs describe pass 2, the audio delivered.
-REPORT_FIELDS = ("excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "duration", "leading_trim_ms",
-                 "pass1_duration_ms", "pass1_overrun_ms", "fit_speed", "pass2_duration_ms", "pass2_overrun_ms",
-                 "status", "track", "adjusted_start_TCR", "adjusted_end_TCR")
+# One record per row, every pass side by side. tcr_duration_ms is the slot (TCR OUT - TCR IN); audio
+# durations are the meter (first sound to end of speech). Overruns are negative for short lines.
+# Speeds and percentages have 8 significant figures. status, track and the adjusted TCRs describe pass 2.
+MEASUREMENT_FIELDS = ("audio_duration_ms", "overrun_ms", "percent_overrun", "desired_speed")
+REPORT_FIELDS = ("excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "fps", "start_ms", "end_ms",
+                 "tcr_duration_ms", "original_dialogue", "final_dialogue", "rewritten", "rewrite_attempts",
+                 "leading_trim_ms",
+                 *(f"pass1_{field}" for field in MEASUREMENT_FIELDS),
+                 *(f"pass1_5_{field}" for field in MEASUREMENT_FIELDS),
+                 "pass2_speed", "pass2_audio_duration_ms", "pass2_overrun_ms", "pass2_percent_overrun",
+                 "within_target", "status", "note", "track", "adjusted_start_TCR", "adjusted_end_TCR")
 
 TIMELINE_FIELDS = ("Dialogue", "Original time start", "Original time end",
                    "Adjusted time start", "Adjusted time end", "Delay")
@@ -109,13 +116,18 @@ def write_report(path, records):
     write_csv(path, records, REPORT_FIELDS)
 
 
+def is_number(text):
+    return re.fullmatch(r"-?\d+(\.\d+)?", text.strip()) is not None
+
+
 def write_csv(path, records, fields):
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for record in records:
             # Prevent spreadsheet formulas when opening the report in Excel.
-            safe = {key: ("'" + value if isinstance(value, str)
+            # Plain numbers such as a negative percentage (-50.000000) are left as numbers.
+            safe = {key: ("'" + value if isinstance(value, str) and not is_number(value)
                           and value.lstrip().startswith(("=", "+", "-", "@")) else value)
                     for key, value in record.items()}
             writer.writerow(safe)

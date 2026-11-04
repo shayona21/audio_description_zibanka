@@ -1,10 +1,12 @@
 """Dub one episode with the AD version 2 engine (or import AD version 2's audio), keeping every
 line as its own clip.
 
-Generating is V2's pipeline (``v2/pipeline.py``) step for step: ElevenLabs per row (pass 1), pass 2
-(each line fitted to its slot with FFmpeg, 0.70x to 1.50x), ``place_dialogue`` for collisions,
-``build_track`` per character. Importing takes both passes' line clips from an AD version 2 ZIP
-instead and goes straight to placing and building. Differences from V2, all needed by the review:
+Generating follows V2's pipeline (``v2/pipeline.py``) without its Gemini step: ElevenLabs per row
+(pass 1), pass 2 (FFmpeg, between ``MIN_SPEED`` and ``MAX_SPEED``, nothing for lines within 2% of
+their slot), ``place_dialogue`` for collisions, ``build_track`` per character. A line V2 would send
+to Gemini (needing more than the limits) stays at 1.0x and is marked MANUAL_REVIEW: the reviewer
+rewrites it here. Importing takes each row's pass 1.5 take from an AD version 2 ZIP and the speed
+V2 gave it, then goes straight to placing and building. Differences from V2, all needed by the review:
 
 * Generating is resumable: a clip already on disk is reused, so retrying after an ElevenLabs error
   carries on from the failed line instead of paying for the earlier lines again.
@@ -12,7 +14,8 @@ instead and goes straight to placing and building. Differences from V2, all need
   (``set_line_speed``): only that clip changes, the episode is re-placed with V2's rule, and only
   the tracks that actually changed are rebuilt.
 
-Each line has two files: ``clips/<row>.take.wav`` is the take (pass 1: ElevenLabs as delivered) and
+Each line has two files: ``clips/<row>.take.wav`` is the take (ElevenLabs, leading silence trimmed; for an imported run,
+V2's pass 1.5 take) and
 ``clips/<row>.wav`` is what plays (the take at the line's speed; at first, pass 2). Speeds are
 always applied to the take, so changes never stack. Per line, the session records a ``take`` dict:
 ``fit_speed`` (pass 2's choice) and ``needed_speed`` (spoken length / slot with no limits, to tell
@@ -27,7 +30,7 @@ import sys
 import wave
 
 from v2.audio_builder import build_track, read_clip
-from v2.audio_speed import change_speed, limit_speed, needed_speed, trim_leading_silence
+from v2.audio_speed import change_speed, check_ffmpeg, measure, pass2_speed, trim_leading_silence
 from v2.exporter import format_tcr
 from v2.timing import place_dialogue
 
@@ -88,10 +91,15 @@ def synthesize_line(row, fps, synthesize):
                        row=row.row_number) from exc
 
 
-def describe_take(wav, row, fit=None):
-    """Speeds for a take. ``fit`` is pass 2's speed when already known (an imported V2 run)."""
-    needed = needed_speed(wav, row.end_ms - row.start_ms)
-    return {"fit_speed": limit_speed(needed) if fit is None else fit, "needed_speed": round(needed, 2)}
+def describe_take(wav, row):
+    """Speeds for a take: V2's pass 2 rule. A take that needs more than the limits is left at 1.0x
+    and marked for manual review, as V2 does when Gemini cannot bring a line within them."""
+    measured = measure(wav, row.end_ms - row.start_ms)
+    info = {"fit_speed": pass2_speed(measured, manual_review=measured.needs_rewrite),
+            "needed_speed": measured.desired_speed}
+    if measured.needs_rewrite:
+        info.update(status="MANUAL_REVIEW", note="needs a speed outside the limits: rewrite the line")
+    return info
 
 
 def prepare_take(row, fps, wav):
@@ -226,18 +234,23 @@ def dub_episode(folder, rows, summary, fps, synthesize, report=lambda **_: None,
     return assemble(folder, rows, summary, fps, clip_lengths(folder, rows)), takes
 
 
-def import_clips(folder, rows, clips, fits):
-    """Store an AD version 2 run's lines: pass 1 is the take, pass 2 plays as it is (V2's own audio,
-    no FFmpeg needed). ``clips`` maps each row to ``(pass 1 bytes, pass 2 bytes)`` and ``fits`` to the
-    speed V2 fitted it at. Returns ``{row: take info}``."""
+def import_clips(folder, rows, clips, takes, fps):
+    """Store an AD version 2 run's lines: the pass 1.5 take is the take, and what plays is the take at
+    the speed V2's pass 2 gave it (the same FFmpeg call, so V2's own audio). ``clips`` maps each row to
+    its take bytes and ``takes`` to its take info from the report."""
     folder = Path(folder)
     (folder / "clips").mkdir(parents=True, exist_ok=True)
-    takes = {}
+    if any(takes[row.row_number]["fit_speed"] != 1.0 for row in rows):
+        check_ffmpeg()
     for row in rows:
-        take, clip = clips[row.row_number]
-        takes[row.row_number] = describe_take(take, row, fit=fits[row.row_number])
+        take = clips[row.row_number]
+        try:
+            clip = change_speed(take, takes[row.row_number]["fit_speed"])
+            read_clip(clip)
+        except Exception as exc:
+            raise DubError(f"Row {row.row_number} ({row.character} at {format_tcr(row.start_ms, fps)}): "
+                           f"applying AD Tool V2's speed failed: {exc}", row=row.row_number) from exc
         save_take(folder, row.row_number, take, clip)
-    return takes
 
 
 def _replace_and_rebuild(folder, rows, summary, fps, row_number, write, previous):

@@ -140,10 +140,11 @@
         <div class="format-help" id="format-help" hidden>
             <p><b>Generate</b>: the script in the same workbook format as AD version 2, for one episode. Headers in row 1:
                 EP NO, TCR IN, TCR OUT, CHARACTERS, VOICE ID and TARGET DIALOGUE. Each line is sent to ElevenLabs with
-                its VOICE ID and audio tags such as [laughing], then fitted to its slot with FFmpeg (0.70x to 1.50x),
-                exactly as AD version 2 does.</p>
+                its VOICE ID and audio tags such as [laughing], then fitted to its slot with FFmpeg (0.80x to 1.20x) as
+                AD version 2 does. A line that would need more is left at 1.00x and marked for manual review.</p>
             <p><b>AD Tool V2 audio</b>: a finished run on this server, or the ZIP AD Tool V2 delivered. Pick the episode;
-                its lines are used as AD Tool V2 made them, with no new ElevenLabs request. The frame rate is the run's own.</p>
+                its lines are used as AD Tool V2 made them, Gemini rewrites included, with no new ElevenLabs request.
+                Only the ZIP's processing report and line clips are read, so no frame rate or worksheet is needed.</p>
             <p><b>Video</b>: the episode picture, starting at 00:00:00:00 like the dubbed tracks.</p>
         </div>
 

@@ -12,7 +12,7 @@ v2/.venv/bin/python -m pip install -r v2/requirements.txt
 cp v2/.env.example v2/.env
 ```
 
-Set `ELEVENLABS_API_KEY` in `v2/.env`, then run:
+Set `ELEVENLABS_API_KEY` and `GEMINI_API_KEY` in `v2/.env`, then run:
 
 ```sh
 v2/.venv/bin/python -m v2.app
@@ -22,7 +22,13 @@ Open http://127.0.0.1:5071. The original application can continue on port 5070. 
 
 **Every take starts on its first sound.** ElevenLabs puts a short, variable stretch of blank audio before the voice (measured 20–180 ms on Billionaire Bhakri episode 1), which made speech start after TCR IN and broke lipsync. Right after each ElevenLabs request, FFmpeg's `silenceremove` finds the first sound (the first 10 ms louder than −60 dBFS; a breath or click counts as sound) and everything before it is cut, on a whole-millisecond boundary, leaving the speech samples untouched. The amount is printed per row and recorded in `processing_report.csv` (`leading_trim_ms`). Trailing silence is kept. Quality Check trims regenerated lines the same way. `measure_leading_silence.py` measures the blank on any run ZIP; on a run made after this change it should report about 0 ms.
 
-**Pass 2 fits every line to its slot.** After ElevenLabs (pass 1), the spoken part of each clip is measured (the silence ElevenLabs adds before and after the voice is not counted) and compared with the slot, TCR OUT − TCR IN. A line more than 0.10 s off is time-stretched with FFmpeg's `atempo` by spoken ÷ slot, keeping the voice's pitch: too-long lines are sped up and too-short lines slowed down, held between **0.70x and 1.50x**. No second ElevenLabs request is made. FFmpeg must be on PATH; a missing FFmpeg is reported before any speech is generated. Each line's speed is recorded in `processing_report.csv` (`fit_speed`). Pass 2 replaces the earlier 1.00x–1.20x speed dial. The ZIP holds both passes, so pass 1 and pass 2 can be compared line by line and track by track.
+**Three passes fit every line to its slot** (TCR OUT − TCR IN). Limits are set once in `v2/audio_speed.py` (`MIN_SPEED`, `MAX_SPEED`, `NORMAL_TOLERANCE_PERCENT`, `SUCCESS_TARGET_PERCENT`).
+
+- **Pass 1:** ElevenLabs generates every row, the leading silence is trimmed, and the take is measured. Its *audio duration* (the meter) runs from the first sound to the end of speech; trailing silence is not counted. `overrun_ms` = audio − slot (negative when the line is too short), `percent_overrun` = overrun ÷ slot × 100, `desired_speed` = audio ÷ slot with no limits. Speeds and percentages keep 8 significant figures. A row within ±2% is *normal* and is never changed. Pass 1 audio is not in the download.
+- **Pass 1.5:** a row whose desired speed is above 1.2x or below 0.8x is rewritten by Gemini (`v2/rewrite.py`, model `MODEL_ID`) to last its slot at 1.0x, keeping its meaning, tone and character (the character's other lines in the episode are sent for context; `[tags]` are kept exactly), then generated again with ElevenLabs. Up to 2 attempts; the second is told how the first came out. The attempt closest to 1.0x is kept, stopping early once one is within 2%. If the best rewrite is still outside 0.8x–1.2x, or Gemini fails, or the line is tag-only, the row is kept at 1.0x and flagged `MANUAL_REVIEW`. More than 10% of rows flagged prints a warning: that points to a problem earlier in the pipeline. Set `GEMINI_API_KEY` in `v2/.env`.
+- **Pass 2:** FFmpeg's `atempo` applies the desired speed, held between 0.8x and 1.2x, keeping the voice's pitch, to every row that is neither normal nor flagged. Each line is then measured again. The run prints its success rate: the share of rows at most 2% over their slot (shorter lines count as within target), against a target of 90%.
+
+FFmpeg must be on PATH; a missing FFmpeg or Gemini key is reported before any speech is generated.
 
 ## Spreadsheet contract
 
@@ -51,12 +57,11 @@ The ZIP contains:
 
 | Path | Contents |
 | --- | --- |
-| `pass1/lines/ep<episode>_<character>_row<excel row>.wav` | Pass 1: each dubbed row (rows with a VOICE ID) as ElevenLabs delivered it, with the leading blank audio trimmed |
-| `pass1/tracks/ep<episode>_<character>.wav` | Pass 1: one full-length timeline per episode and character, built from the pass 1 lines |
-| `pass2/lines/ep<episode>_<character>_row<excel row>.wav` | Pass 2: the same rows fitted to their slots (the audio delivered) |
-| `pass2/tracks/ep<episode>_<character>.wav` | Pass 2: one full-length timeline per episode and character, built from the pass 2 lines |
-| `ep<episode>_timeline.csv` | All characters of an episode in adjusted chronological order, pass 2 (source Excel row breaks ties) |
-| `processing_report.csv` | One record per row, pass 1 and pass 2 side by side (columns below) |
+| `pass1_5/lines/ep<episode>_<character>_row<excel row>.wav` | Each dubbed row before the speed change, leading silence trimmed; rewritten rows use the rewritten take |
+| `pass2/lines/ep<episode>_<character>_row<excel row>.wav` | The same rows after pass 2 (the audio delivered) |
+| `pass2/tracks/ep<episode>_<character>.wav` | One full-length timeline per episode and character, built from the pass 2 lines |
+| `ep<episode>_timeline.csv` | All characters of an episode in adjusted chronological order, with the dialogue actually spoken |
+| `processing_report.csv` | One record per row, every pass side by side (columns below) |
 | `script.xlsx` | A copy of the input workbook |
 
 File names are lowercase with spaces as underscores: EP NO `1` and character `ONSCREEN TEXT` give `ep1_onscreen_text_row3.wav` and `ep1_onscreen_text.wav`. An EP NO that already starts with "EP" is not doubled (`EP01` gives `ep01`). Both passes are placed with the same timing rule below, so each pass's tracks show how that pass plays. The Dubbing Quality Check opens this ZIP directly (or lists finished runs from `v2/runtime/`, using each run's `run.json`). Filenames are sanitized and disambiguated so outputs cannot overwrite each other (names that only differ in case get `_2`). Audio is mono 24 kHz, 16-bit PCM.
@@ -70,21 +75,16 @@ All tracks for an episode start at zero and have the same length: the latest ori
 `processing_report.csv` uses this exact column order:
 
 ```text
-excel_row,episode,character,voice_id,start_TCR,end_TCR,duration,leading_trim_ms,pass1_duration_ms,pass1_overrun_ms,fit_speed,pass2_duration_ms,pass2_overrun_ms,status,track,adjusted_start_TCR,adjusted_end_TCR
+excel_row,episode,character,voice_id,start_TCR,end_TCR,fps,start_ms,end_ms,tcr_duration_ms,original_dialogue,final_dialogue,rewritten,rewrite_attempts,leading_trim_ms,pass1_audio_duration_ms,pass1_overrun_ms,pass1_percent_overrun,pass1_desired_speed,pass1_5_audio_duration_ms,pass1_5_overrun_ms,pass1_5_percent_overrun,pass1_5_desired_speed,pass2_speed,pass2_audio_duration_ms,pass2_overrun_ms,pass2_percent_overrun,within_target,status,note,track,adjusted_start_TCR,adjusted_end_TCR
 ```
 
-- `excel_row` identifies the original Excel row; records retain source row order across episodes.
-- `start_TCR` and `end_TCR` show the original script times as `HH:MM:SS:FF` at the selected frame rate.
-- `duration` is the original scripted end minus start, **in milliseconds**.
-- `leading_trim_ms` is how much blank audio was cut from the start of ElevenLabs' clip.
-- `pass1_duration_ms` is the length of ElevenLabs' clip after that trim; `pass1_overrun_ms` is `max(0, pass1_duration_ms − duration)`.
-- `fit_speed` is the speed pass 2 applied to the line, e.g. `1.16` (`1.00` when the line already fitted).
-- `pass2_duration_ms` is the measured audio length **after pass 2**; `pass2_overrun_ms` is `max(0, pass2_duration_ms − duration)`. Overruns do not include delays caused by that character's earlier dialogue.
-- `adjusted_start_TCR` and `adjusted_end_TCR` show the actual placement and speech end.
-- TCR display rounds to the nearest frame (half-frame ties round up), including correct second/minute/hour rollover. Audio placement calculations remain in milliseconds, and the combined timeline preserves millisecond precision. Native Excel times that fall between frames are also rounded for TCR display only.
-- `TCR_OUT_OVERRUN` in `status` means the row's pass 2 audio exceeded its original scripted duration. It need not delay any later line if there is enough silence available. A row delayed by the same character's earlier dialogue can still be `OK` if its own duration fits. Overlaps between different characters are allowed. `track` names the corresponding WAV.
+- `start_TCR`/`end_TCR` are the script times as `HH:MM:SS:FF` at the run's frame rate (`fps`); `start_ms`/`end_ms` the same in milliseconds; `tcr_duration_ms` is the slot.
+- `final_dialogue` is what is spoken in the delivered audio (the Gemini rewrite when `rewritten` is `yes`). `rewrite_attempts` counts Gemini requests.
+- `pass1_*` describe the first ElevenLabs take, `pass1_5_*` the take kept after pass 1.5, `pass2_*` the delivered audio. `pass2_speed` is the FFmpeg speed applied (`1.0000000` for normal and flagged rows).
+- `status` is `OK`, `TCR_OUT_OVERRUN` (pass 2 audio more than 2% over its slot) or `MANUAL_REVIEW`; `note` says why a row was flagged.
+- `adjusted_start_TCR` and `adjusted_end_TCR` show the actual placement and the end of the pass 2 clip. TCR display rounds to the nearest frame (half-frame ties round up); audio placement stays in milliseconds.
 
-Validation runs before speech generation. Requests are sequential and are not automatically retried: retrying after a provider failure can incur additional charges for already generated rows. A failed run produces no completed ZIP and discards temporary audio. API voice availability is checked by ElevenLabs during generation. No live API calls are needed for tests.
+Validation runs before speech generation. Requests are sequential and are not automatically retried: retrying after a provider failure can incur additional charges for already generated rows. A failed run produces no completed ZIP and discards temporary audio. API voice availability is checked by ElevenLabs during generation. No live API calls are needed for tests: ElevenLabs and Gemini are replaced by fakes.
 
 ## Command line
 

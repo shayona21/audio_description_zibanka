@@ -14,8 +14,8 @@ import zipfile
 
 from quality_check.app import create_app
 from quality_check.tests.helpers import (ONE_EPISODE, SECOND_EPISODE, dub_zip, fake_voice, have_pydub,
-                                         workbook_bytes)
-from v2.audio_speed import fit_speed
+                                         no_rewrite, workbook_bytes)
+from v2.audio_speed import measure, pass2_speed
 
 
 def make_client(runtime, synthesize=fake_voice, v2_runtime=None):
@@ -116,8 +116,9 @@ class DubbingTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 5)
 
         # The same script through V2's own pipeline must give byte-identical audio per character.
+        # This tool does not call Gemini, so V2 is run without it: both keep long and short lines at 1.0x.
         expected = {}
-        with zipfile.ZipFile(io.BytesIO(dub_zip(self.tmp.name, ONE_EPISODE))) as archive:
+        with zipfile.ZipFile(io.BytesIO(dub_zip(self.tmp.name, ONE_EPISODE, rewrite=no_rewrite))) as archive:
             for name in ("KUHU", "AMRITA"):
                 with wave.open(io.BytesIO(archive.read(f"pass2/tracks/ep1_{name.lower()}.wav"))) as wav:
                     expected[name] = wav.readframes(wav.getnframes())
@@ -203,12 +204,18 @@ class DubbingTests(unittest.TestCase):
         self.assertNotIn("speed", record)                                   # no speed dial any more
         folder = self.runtime / sid
         lines = {line["row"]: line for line in record["audio"]["lines"]}
+        # Row 6 needs 0.81x: within the limits, so pass 2 slows it. Rows 2-5 need more than the
+        # limits allow: they stay at 1.0x and are marked for the reviewer to rewrite.
         self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
-                         {2: 0.7, 3: 0.7, 4: 1.5, 5: 0.7, 6: 0.81})
-        self.assertEqual(lines[4]["needed_speed"], 2.16)                    # held at the 1.5x limit
+                         {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 0.81})
+        self.assertEqual({row: line["status"] for row, line in lines.items()},
+                         {2: "MANUAL_REVIEW", 3: "MANUAL_REVIEW", 4: "MANUAL_REVIEW", 5: "MANUAL_REVIEW", 6: ""})
+        self.assertEqual(lines[4]["needed_speed"], 2.16)                    # unlimited, 8 significant figures
+        self.assertTrue(any("manual review" in w for w in record["audio"]["warnings"]))
         for row, line in lines.items():
             take = (folder / "clips" / f"{row}.take.wav").read_bytes()
-            self.assertEqual(fit_speed(take, line["end_ms"] - line["start_ms"]), line["fit_speed"])
+            measured = measure(take, line["end_ms"] - line["start_ms"])
+            self.assertEqual(pass2_speed(measured, manual_review=measured.needs_rewrite), line["fit_speed"])
             self.assertEqual(line["line_speed"], line["fit_speed"])
             self.assertFalse(line["speed_set"])
             self.assertAlmostEqual(line["audio_end_ms"] - line["audio_start_ms"],
@@ -250,8 +257,9 @@ class DubbingTests(unittest.TestCase):
         self.assertEqual(body["changed_tracks"], [1])                 # AMRITA only
         self.assertEqual(self.track_bytes(sid, 0), kuhu_before)       # KUHU's file untouched
         new = {l["row"]: l for l in body["audio"]["lines"]}
-        self.assertEqual(new[3]["fit_speed"], 0.7)                    # the new take is fitted too
-        self.assertAlmostEqual(new[3]["audio_end_ms"] - new[3]["audio_start_ms"], natural_ms("Out!") / 0.7, delta=30)
+        # The new take gets the same rule: far too short even at 0.8x, so 1.0x and marked for review.
+        self.assertEqual((new[3]["fit_speed"], new[3]["status"]), (1.0, "MANUAL_REVIEW"))
+        self.assertAlmostEqual(new[3]["audio_end_ms"] - new[3]["audio_start_ms"], natural_ms("Out!"), delta=30)
         self.assertTrue(new[3]["edited"])
         self.assertEqual(new[3]["original"], lines[3]["text"])
         # Row 6 no longer waits for row 3's overrun: it moves back to its own TCR IN.
@@ -325,7 +333,7 @@ class DubbingTests(unittest.TestCase):
         fitted = (folder / "clips" / "3.wav").read_bytes()
         kuhu_before = self.track_bytes(sid, 0)
         before = {l["row"]: l for l in record["audio"]["lines"]}
-        self.assertEqual(before[3]["fit_speed"], 0.7)
+        self.assertEqual(before[3]["fit_speed"], 1.0)                 # beyond the limits: left at 1.0x
         natural = natural_ms(before[3]["text"])
         self.calls.clear()
 
@@ -335,21 +343,25 @@ class DubbingTests(unittest.TestCase):
         self.assertEqual(self.track_bytes(sid, 0), kuhu_before)
         lines = {l["row"]: l for l in body["audio"]["lines"]}
         self.assertEqual((lines[3]["line_speed"], lines[3]["speed_set"]), (1.2, True))
-        self.assertEqual(lines[3]["fit_speed"], 0.7)                  # the suggestion stays pass 2's
+        self.assertEqual(lines[3]["fit_speed"], 1.0)                  # the suggestion stays pass 2's
         self.assertEqual(lines[3]["audio_start_ms"], before[3]["audio_start_ms"])      # same start
         self.assertAlmostEqual(lines[3]["audio_end_ms"] - lines[3]["audio_start_ms"], natural / 1.2, delta=30)
         self.assertLess(lines[6]["audio_start_ms"], before[6]["audio_start_ms"])       # row 6 waits less
         self.assertEqual([m["row"] for m in body["moved"]], [6])
 
-        # Changes never stack: speeds are measured from the take; 1.00x is the take byte for byte
-        # and the fit speed gives the fitted clip back (no longer a reviewer change).
+        # Changes never stack: speeds are measured from the take. The fit speed (here 1.00x) gives the
+        # take back byte for byte and is no longer a reviewer change.
         body = self.speed(client, sid, 3, 1.1).get_json()
         line = next(l for l in body["audio"]["lines"] if l["row"] == 3)
         self.assertAlmostEqual(line["audio_end_ms"] - line["audio_start_ms"], natural / 1.1, delta=30)
-        self.speed(client, sid, 3, 1.0)
+        body = self.speed(client, sid, 3, 1.0).get_json()
         self.assertEqual((folder / "clips" / "3.wav").read_bytes(), take)
-        body = self.speed(client, sid, 3, 0.7).get_json()
-        self.assertEqual((folder / "clips" / "3.wav").read_bytes(), fitted)
+        self.assertEqual(take, fitted)
+        # A line pass 2 slowed down (row 6, 0.81x) returns to that exact clip when set back.
+        fitted6 = (folder / "clips" / "6.wav").read_bytes()
+        self.speed(client, sid, 6, 1.0)
+        body = self.speed(client, sid, 6, 0.81).get_json()
+        self.assertEqual((folder / "clips" / "6.wav").read_bytes(), fitted6)
         self.assertEqual(client.get(f"/session/{sid}").get_json()["line_speeds"], {})
         self.assertEqual({l["row"]: l["audio_start_ms"] for l in body["audio"]["lines"]},
                          {r: l["audio_start_ms"] for r, l in before.items()})
@@ -364,10 +376,10 @@ class DubbingTests(unittest.TestCase):
 
     def test_line_speed_validation(self):
         client, sid, _record = self.dubbed()
-        self.assertEqual(self.speed(client, sid, 3, 1.5).status_code, 200)    # the limits are allowed
-        self.assertEqual(self.speed(client, sid, 3, 0.7).status_code, 200)
-        self.assertEqual(self.speed(client, sid, 3, 1.51).status_code, 400)
-        self.assertEqual(self.speed(client, sid, 3, 0.69).status_code, 400)
+        self.assertEqual(self.speed(client, sid, 3, 1.2).status_code, 200)    # the limits are allowed
+        self.assertEqual(self.speed(client, sid, 3, 0.8).status_code, 200)
+        self.assertEqual(self.speed(client, sid, 3, 1.21).status_code, 400)
+        self.assertEqual(self.speed(client, sid, 3, 0.79).status_code, 400)
         self.assertEqual(self.speed(client, sid, 3, "fast").status_code, 400)
         self.assertEqual(self.speed(client, sid, 99, 1.1).status_code, 404)
 
@@ -398,9 +410,12 @@ class DubbingTests(unittest.TestCase):
         report = {int(r["excel_row"]): r for r in reader}
         self.assertEqual(tuple(reader.fieldnames), REPORT_FIELDS)
         self.assertEqual(sorted(report), [2, 3, 4, 5, 6])
-        self.assertEqual(report[2]["fit_speed"], "0.70")                          # pass 2's fit
-        self.assertEqual(report[6]["fit_speed"], "1.10")                          # the reviewer's speed
-        self.assertEqual(report[6]["pass1_duration_ms"], str(natural_ms(ONE_EPISODE[4][6])))  # the take
+        self.assertEqual(report[2]["pass2_speed"], "1.0000000")                   # pass 2's choice
+        self.assertEqual(report[6]["pass2_speed"], "1.1000000")                   # the reviewer's speed
+        self.assertEqual(report[6]["pass1_audio_duration_ms"], str(natural_ms(ONE_EPISODE[4][6])))  # the take
+        self.assertEqual(report[6]["pass1_desired_speed"], "0.81000000")
+        self.assertEqual((report[3]["final_dialogue"], report[3]["rewritten"]), ("[Angry] Get out!", "yes"))
+        self.assertEqual(report[4]["status"], "MANUAL_REVIEW")                    # untouched, still needs review
         # The Excel: edited text in TARGET DIALOGUE, highlighted with a note; other rows untouched.
         with archive.open("script_qc.xlsx") as handle:
             sheet = load_workbook(io.BytesIO(handle.read())).active
@@ -412,6 +427,7 @@ class DubbingTests(unittest.TestCase):
         self.assertIsNone(sheet.cell(row=2, column=7).comment)
         changes = archive.read("qc_changes.csv").decode("utf-8-sig").splitlines()
         self.assertEqual(len(changes), 3)  # header + row 3 (text) + row 6 (speed)
+        self.assertIn("reviewer", changes[1])
         self.assertIn("1.10x", changes[2])
 
     def test_export_without_changes_keeps_the_script_as_is(self):
@@ -512,24 +528,38 @@ class ImportTests(unittest.TestCase):
                     expected = wav.readframes(wav.getnframes())
                 with wave.open(str(folder / "tracks" / f"{track['index']}.wav")) as wav:
                     self.assertEqual(wav.readframes(wav.getnframes()), expected, track["character"])
-            self.assertEqual((folder / "clips" / "4.wav").read_bytes(), archive.read("pass2/lines/ep1_kuhu_row4.wav"))
-            self.assertEqual((folder / "clips" / "4.take.wav").read_bytes(), archive.read("pass1/lines/ep1_kuhu_row4.wav"))
+            # The take is V2's pass 1.5 clip; what plays is that take at the report's speed, which
+            # is exactly V2's pass 2 clip (row 6 was slowed to 0.81x).
+            for row, name in ((4, "ep1_kuhu_row4.wav"), (6, "ep1_amrita_row6.wav")):
+                self.assertEqual((folder / "clips" / f"{row}.take.wav").read_bytes(), archive.read(f"pass1_5/lines/{name}"))
+                self.assertEqual((folder / "clips" / f"{row}.wav").read_bytes(), archive.read(f"pass2/lines/{name}"))
         lines = {line["row"]: line for line in record["audio"]["lines"]}
         self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
-                         {2: 0.7, 3: 0.7, 4: 1.5, 5: 0.7, 6: 0.81})     # from V2's report
-        self.assertAlmostEqual(lines[4]["needed_speed"], 2.16, delta=0.02)
+                         {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 0.81})     # from V2's report
+        self.assertEqual(lines[4]["needed_speed"], 0.99)                 # the rewrite's own speed
+        # Gemini's rewrites play and show as edits beside the script's wording; row 5's rewrite
+        # still does not fit, so it is marked for manual review.
+        self.assertEqual((lines[4]["edited"], lines[4]["edited_by"], lines[4]["original"]),
+                         (True, "gemini", ONE_EPISODE[2][6]))
+        self.assertTrue(lines[4]["text"].startswith("[Gasps] "))
+        self.assertEqual((lines[6]["edited"], lines[6]["text"]), (False, ONE_EPISODE[4][6]))
+        self.assertEqual(lines[5]["status"], "MANUAL_REVIEW")
+        self.assertIn("kept at 1.0x", lines[5]["note"])
+        warnings = " ".join(record["audio"]["warnings"])
+        self.assertIn("rewritten by Gemini", warnings)
+        self.assertIn("manual review", warnings)
 
     def test_imported_line_speed_is_measured_from_the_natural_take(self):
         record = self.wait(self.start(self.server_run()).get_json()["session_id"])
         sid = record["session_id"]
         folder = self.runtime / sid
-        fitted = (folder / "clips" / "4.wav").read_bytes()
-        natural = natural_ms(next(l["text"] for l in record["audio"]["lines"] if l["row"] == 4))
-        body = self.client.post(f"/session/{sid}/lines/4/speed", json={"speed": 1.0}).get_json()
-        line = next(l for l in body["audio"]["lines"] if l["row"] == 4)
+        fitted = (folder / "clips" / "6.wav").read_bytes()
+        natural = natural_ms(next(l["text"] for l in record["audio"]["lines"] if l["row"] == 6))
+        body = self.client.post(f"/session/{sid}/lines/6/speed", json={"speed": 1.0}).get_json()
+        line = next(l for l in body["audio"]["lines"] if l["row"] == 6)
         self.assertAlmostEqual(line["audio_end_ms"] - line["audio_start_ms"], natural, delta=40)
-        self.client.post(f"/session/{sid}/lines/4/speed", json={"speed": 1.5})
-        self.assertEqual((folder / "clips" / "4.wav").read_bytes(), fitted)  # back to V2's clip exactly
+        self.client.post(f"/session/{sid}/lines/6/speed", json={"speed": 0.81})
+        self.assertEqual((folder / "clips" / "6.wav").read_bytes(), fitted)  # back to V2's clip exactly
 
     def test_regenerating_an_imported_line_uses_elevenlabs_once(self):
         record = self.wait(self.start(self.server_run()).get_json()["session_id"])
@@ -537,13 +567,21 @@ class ImportTests(unittest.TestCase):
         body = self.client.post(f"/session/{sid}/lines/3", json={"text": "Out!"}).get_json()
         self.assertEqual(self.calls, ["Out!"])
         line = next(l for l in body["audio"]["lines"] if l["row"] == 3)
-        self.assertEqual((line["fit_speed"], line["edited"]), (0.7, True))
+        self.assertEqual((line["fit_speed"], line["edited"], line["edited_by"]), (1.0, True, "reviewer"))
+        self.assertEqual(line["original"], ONE_EPISODE[1][6])            # still the script's wording
         archive = zipfile.ZipFile(io.BytesIO(self.client.get(f"/session/{sid}/export").data))
         self.assertIn("ep1_kuhu.wav", archive.namelist())
+        # The export writes Gemini's rewrites and the reviewer's change into the run's script.
+        from openpyxl import load_workbook
+        sheet = load_workbook(io.BytesIO(archive.read("Show_S1_ep1_qc.xlsx"))).active   # named after the run
+        self.assertEqual(sheet.cell(row=3, column=7).value, "Out!")
+        self.assertIn("Rewritten by Gemini", sheet.cell(row=4, column=7).comment.text)
+        changes = archive.read("qc_changes.csv").decode("utf-8-sig")
+        self.assertIn("Gemini (AD Tool V2)", changes)
 
-    def test_uploaded_zip_finds_the_frame_rate_the_run_used(self):
+    def test_uploaded_zip_reads_its_frame_rate_from_the_report(self):
         data = dub_zip(self.tmp.name, ONE_EPISODE + SECOND_EPISODE, name="thirty.zip", fps=30)
-        form = {"dub": (io.BytesIO(data), "Show_S1.zip"), "fps": "25"}
+        form = {"dub": (io.BytesIO(data), "Show_S1.zip")}                   # no settings needed
         response = self.client.post("/v2-runs", data=form, content_type="multipart/form-data")
         self.assertEqual(response.status_code, 201, response.get_json())
         details = response.get_json()
@@ -566,6 +604,13 @@ class ImportTests(unittest.TestCase):
         response = upload(old.getvalue())
         self.assertEqual(response.status_code, 400)
         self.assertIn("earlier AD Tool V2", response.get_json()["error"])
+        old = io.BytesIO()
+        with zipfile.ZipFile(old, "w") as archive:          # line clips, but a report from before pass 1.5
+            archive.writestr("pass1_5/lines/ep1_kuhu_row2.wav", b"RIFF")
+            archive.writestr("processing_report.csv", "excel_row,episode,duration,fit_speed\n2,1,1000,1.00\n")
+        response = upload(old.getvalue())
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("earlier AD Tool V2", response.get_json()["error"])
         self.assertFalse(any((self.runtime / "uploads").iterdir()))      # refused uploads are not kept
 
         run_id = self.server_run(rows=ONE_EPISODE)
@@ -575,7 +620,7 @@ class ImportTests(unittest.TestCase):
         # A clip missing from the ZIP is reported by row before anything is stored.
         path = self.v2_runtime / run_id / "AD_v2_output.zip"
         with zipfile.ZipFile(path) as archive:
-            items = {name: archive.read(name) for name in archive.namelist() if name != "pass2/lines/ep1_amrita_row3.wav"}
+            items = {name: archive.read(name) for name in archive.namelist() if name != "pass1_5/lines/ep1_amrita_row3.wav"}
         with zipfile.ZipFile(path, "w") as archive:
             for name, data in items.items():
                 archive.writestr(name, data)

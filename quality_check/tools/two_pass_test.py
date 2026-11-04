@@ -41,14 +41,14 @@ from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from v2.audio_speed import FIT_TOLERANCE_MS, MAX_FIT_SPEED, MIN_FIT_SPEED, change_speed, speech_span
+from v2.audio_speed import MAX_FIT_SPEED, MIN_FIT_SPEED, change_speed, speech_span
 from v2.excel_parser import SUPPORTED_FPS, parse_excel
 from v2.exporter import format_tcr
 from v2.tts_client import MODEL_ID, SAMPLE_RATE, VOICE_SETTINGS, prepare_speech_text, provider_error_detail
 
-FFMPEG_MIN, FFMPEG_MAX = MIN_FIT_SPEED, MAX_FIT_SPEED   # AD version 2's pass 2 limits (0.7x, 1.5x)
+FFMPEG_MIN, FFMPEG_MAX = MIN_FIT_SPEED, MAX_FIT_SPEED   # AD version 2's pass 2 limits (0.8x, 1.2x)
 ELEVENLABS_MIN, ELEVENLABS_MAX = 0.7, 1.2      # ElevenLabs' accepted speed range
-TOLERANCE_S = FIT_TOLERANCE_MS / 1000          # a line within this of its slot is left as it is
+TOLERANCE_S = 0.10                             # this experiment's default: a line within this of its slot is left as it is
 
 HERE = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = HERE / "tools_outputs"     # every run's workbook and audio folder go here

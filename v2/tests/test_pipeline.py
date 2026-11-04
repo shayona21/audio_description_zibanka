@@ -15,7 +15,7 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from v2.app import create_app
-from v2.audio_speed import FIT_TOLERANCE_MS, MAX_FIT_SPEED, MIN_FIT_SPEED, change_speed, fit_speed, needed_speed, speech_span
+from v2.audio_speed import MAX_SPEED, MIN_SPEED, change_speed, fit_speed, needed_speed, speech_span
 from v2.excel_parser import TEMPLATE_HEADERS, WorkbookValidationError, parse_excel, timecode_to_ms
 from v2.exporter import format_tcr, line_name, track_names, timeline_names
 from v2.models import DialogueRow
@@ -44,6 +44,11 @@ class PipelineTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        # No live Gemini calls: by default every rewrite returns the line unchanged.
+        for target in ("v2.pipeline.GeminiRewriter", "v2.app.GeminiRewriter"):
+            patcher = patch(target, return_value=lambda request: request.text)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def workbook(self, rows, headers=TEMPLATE_HEADERS):
         path = self.root / "input.xlsx"
@@ -135,7 +140,8 @@ class PipelineTests(unittest.TestCase):
             audio = {"tracks/ep001_alice.wav", "tracks/ep001_bob.wav", "tracks/ep002_alice.wav",
                      "lines/ep001_alice_row2.wav", "lines/ep001_bob_row3.wav", "lines/ep001_alice_row4.wav",
                      "lines/ep002_alice_row5.wav"}
-            self.assertEqual(set(archive.namelist()), {f"{p}/{name}" for p in ("pass1", "pass2") for name in audio} | {
+            lines = {name for name in audio if name.startswith("lines/")}
+            self.assertEqual(set(archive.namelist()), {f"pass1_5/{name}" for name in lines} | {f"pass2/{name}" for name in audio} | {
                 "ep001_timeline.csv", "ep002_timeline.csv", "processing_report.csv", "script.xlsx"})
             self.assertEqual(archive.read("script.xlsx"), path.read_bytes())
             for name in ("ep001_alice.wav", "ep001_bob.wav"):
@@ -165,7 +171,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(rows[1]["status"], "OK")
         self.assertEqual(rows[1]["adjusted_start_TCR"], "00:00:01:10")
         self.assertEqual(rows[1]["start_TCR"], "00:00:01:04")
-        self.assertEqual(rows[1]["pass2_overrun_ms"], "0")
+        self.assertEqual(rows[1]["pass2_overrun_ms"], "-440")      # 400 ms of audio in an 840 ms slot
 
     def test_character_local_delays_match_audio_and_combined_script_exports(self):
         # Unsorted characters and episodes still have independent schedules.
@@ -220,7 +226,7 @@ class PipelineTests(unittest.TestCase):
             )))
             self.assertEqual(report[0]["start_TCR"], "00:00:40:00")
             self.assertEqual(report[0]["adjusted_start_TCR"], "00:00:45:00")
-            self.assertEqual(report[0]["duration"], "2000")
+            self.assertEqual(report[0]["tcr_duration_ms"], "2000")
             self.assertEqual(report[0]["pass2_overrun_ms"], "0")
 
     def test_available_silence_absorbs_delays_within_each_character(self):
@@ -243,7 +249,7 @@ class PipelineTests(unittest.TestCase):
                              ["00:00:00:00", "00:00:15:00", "00:00:20:00", "00:00:12:00", "00:00:26:00"])
             self.assertEqual([r["adjusted_end_TCR"] for r in records],
                              ["00:00:15:00", "00:00:16:00", "00:00:26:00", "00:00:12:13", "00:00:26:13"])
-            self.assertEqual([int(r["pass2_overrun_ms"]) for r in records], [5000, 0, 4000, 0, 0])
+            self.assertEqual([int(r["pass2_overrun_ms"]) for r in records], [5000, -2000, 4000, -500, -1500])
             timeline = list(csv.DictReader(io.StringIO(archive.read("ep001_timeline.csv").decode("utf-8-sig"))))
             self.assertEqual([r["Dialogue"] for r in timeline],
                              ["Alice: first", "Bob: bob", "Alice: short", "Alice: long", "Alice: last"])
@@ -304,9 +310,12 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(all("/" not in name and "\\" not in name for name in names.values()))
 
     def test_report_exact_schema_and_frame_rate_calculations(self):
-        headers = ["excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "duration",
-                   "leading_trim_ms", "pass1_duration_ms", "pass1_overrun_ms", "fit_speed", "pass2_duration_ms", "pass2_overrun_ms",
-                   "status", "track", "adjusted_start_TCR", "adjusted_end_TCR"]
+        measured = ("audio_duration_ms", "overrun_ms", "percent_overrun", "desired_speed")
+        headers = ["excel_row", "episode", "character", "voice_id", "start_TCR", "end_TCR", "fps", "start_ms", "end_ms",
+                   "tcr_duration_ms", "original_dialogue", "final_dialogue", "rewritten", "rewrite_attempts",
+                   "leading_trim_ms", *(f"pass1_{f}" for f in measured), *(f"pass1_5_{f}" for f in measured),
+                   "pass2_speed", "pass2_audio_duration_ms", "pass2_overrun_ms", "pass2_percent_overrun",
+                   "within_target", "status", "note", "track", "adjusted_start_TCR", "adjusted_end_TCR"]
         expected_ends = {24: "00:00:01:05", 25: "00:00:01:05", 30: "00:00:01:06",
                          50: "00:00:01:10", 60: "00:00:01:11"}
         path = self.workbook([dialogue(start="00:00:00:01", end="00:00:01:01")])
@@ -317,9 +326,12 @@ class PipelineTests(unittest.TestCase):
                      fit_lines=False)
                 with zipfile.ZipFile(output) as archive:
                     records = list(csv.reader(io.StringIO(archive.read("processing_report.csv").decode("utf-8-sig"))))
+                    start_ms, end_ms = timecode_to_ms("00:00:00:01", fps), timecode_to_ms("00:00:01:01", fps)
+                    measured_values = ["1173", "173", "17.300000", "1.1730000"]
                     self.assertEqual(records, [headers, [
-                        "2", "001", "Alice", "alice-voice", "00:00:00:01", "00:00:01:01",
-                        "1000", "0", "1173", "173", "1.00", "1173", "173", "TCR_OUT_OVERRUN", "ep001_alice.wav",
+                        "2", "001", "Alice", "alice-voice", "00:00:00:01", "00:00:01:01", str(fps), str(start_ms), str(end_ms),
+                        "1000", "Hello", "Hello", "no", "0", "0", *measured_values, *measured_values,
+                        "1.0000000", "1173", "173", "17.300000", "no", "TCR_OUT_OVERRUN", "", "ep001_alice.wav",
                         "00:00:00:01", end,
                     ]])
                     with wave.open(io.BytesIO(archive.read("pass2/tracks/ep001_alice.wav"))) as audio:
@@ -419,76 +431,134 @@ class PipelineTests(unittest.TestCase):
         return clip.set_sample_width(2).export(io.BytesIO(), format="wav").getvalue()
 
     def test_fit_speed_measures_speech_and_holds_limits(self):
+        # Clips here start on their first sound, as they do after the leading-silence trim.
         self.assertEqual(speech_span(self.spoken_clip(1000)), (150, 1150, 1350))
-        self.assertEqual(fit_speed(self.spoken_clip(2600), 2000), 1.3)              # too long: faster
-        self.assertEqual(fit_speed(self.spoken_clip(800), 1000), 0.8)               # too short: slower
-        self.assertEqual(fit_speed(self.spoken_clip(1000 + FIT_TOLERANCE_MS), 1000), 1.0)  # within tolerance
-        self.assertEqual(fit_speed(self.spoken_clip(4000), 1000), MAX_FIT_SPEED)    # held at 1.5x
-        self.assertEqual(fit_speed(self.spoken_clip(200), 1000), MIN_FIT_SPEED)     # held at 0.7x
-        self.assertEqual(fit_speed(wav_bytes(500, value=0), 1000), 1.0)             # silence: left alone
-        self.assertAlmostEqual(needed_speed(self.spoken_clip(4000), 1000), 4.0, places=2)  # unlimited
+        self.assertEqual(fit_speed(self.spoken_clip(2300, lead_ms=0), 2000), 1.15)      # too long: faster
+        self.assertEqual(fit_speed(self.spoken_clip(900, lead_ms=0), 1000), 0.9)        # too short: slower
+        self.assertEqual(fit_speed(self.spoken_clip(1020, lead_ms=0), 1000), 1.0)       # within 2%: normal
+        self.assertEqual(fit_speed(self.spoken_clip(4000, lead_ms=0), 1000), MAX_SPEED)  # held at 1.2x
+        self.assertEqual(fit_speed(self.spoken_clip(200, lead_ms=0), 1000), MIN_SPEED)   # held at 0.8x
+        self.assertEqual(needed_speed(self.spoken_clip(4000, lead_ms=0), 1000), 4.0)    # unlimited
         clip = self.spoken_clip(500)
         with patch("v2.audio_speed.shutil.which", return_value=None):
             self.assertIs(change_speed(clip, 1.0), clip)                            # 1.00x needs no FFmpeg
             with self.assertRaisesRegex(RuntimeError, "FFmpeg"):
                 change_speed(clip, 1.2)
-        for bad in ("", "bad", "nan", 0.69, 1.51):
+        for bad in ("", "bad", "nan", 0.79, 1.21):
             with self.assertRaises(ValueError):
                 change_speed(clip, bad)
 
-    def test_pipeline_fits_lines_and_outputs_tracks_and_lines(self):
+    def test_pipeline_rewrites_fits_and_flags_lines(self):
+        bob = dict(character="Bob", voice="b")
         path = self.workbook([
-            dialogue(start="00:00:00:00", end="00:00:02:00", text="long"),       # 2.6 s speech in 2.0 s
-            dialogue(start="00:00:03:00", end="00:00:04:00", text="short"),      # 0.8 s speech in 1.0 s
-            dialogue(start="00:00:05:00", end="00:00:06:00", text="fits"),       # 1.05 s: within 0.1 s
-            dialogue(character="Bob", voice="b", start="00:00:01:00", end="00:00:02:00", text="huge"),
+            dialogue(start="00:00:00:00", end="00:00:02:00", text="long"),               # 1.15x: pass 2 only
+            dialogue(start="00:00:03:00", end="00:00:04:00", text="short"),              # 0.90x: pass 2 only
+            dialogue(start="00:00:05:00", end="00:00:06:00", text="fits"),               # within 2%: untouched
+            dialogue(**bob, start="00:00:00:00", end="00:00:02:00", text="way too long"),   # 1.5x: rewritten
+            dialogue(**bob, start="00:00:03:00", end="00:00:05:00", text="too short"),      # 0.2x: rewritten
+            dialogue(**bob, start="00:00:06:00", end="00:00:08:00", text="stubborn"),       # 2.5x: rewrites fail
+            dialogue(**bob, start="00:00:09:00", end="00:00:11:00", text="[Gasps]"),        # tag-only
         ])
-        speech = {"long": 2600, "short": 800, "fits": 1050, "huge": 4000}
-        output = self.root / "fitted.zip"
-        summary = run_pipeline(path, output, synthesize=lambda text, _v: self.spoken_clip(speech[text]),
-                               progress=lambda _: None)
-        self.assertEqual(summary["fitted_rows"], 3)
+        speech = {"long": 2300, "short": 900, "fits": 1010, "way too long": 3000, "shorter": 2100,
+                  "shortest": 2000, "too short": 400, "padded": 1500, "padded more": 1600, "stubborn": 5000,
+                  "still long": 4000, "still long 2": 3000, "[Gasps]": 500}
+        rewrites = {"way too long": ["shorter", "shortest"], "too short": ["padded", "padded more"],
+                    "stubborn": ["still long", "still long 2"]}
+        requests = []
+
+        def rewrite(request):
+            requests.append(request)
+            return rewrites[request.text][len(request.previous_attempts)]
+
+        synthesized = []
+
+        def synthesize(text, _voice):
+            synthesized.append(text)
+            return self.spoken_clip(speech[text])
+
+        output = self.root / "rewritten.zip"
+        log = []
+        summary = run_pipeline(path, output, synthesize=synthesize, rewrite=rewrite, progress=log.append)
+        self.assertEqual((summary["rewritten_rows"], summary["manual_review_rows"], summary["fitted_rows"]), (3, 2, 3))
+        self.assertFalse(summary["success"])                         # 6 of 7 within target
+        self.assertEqual(summary["success_percent"], "85.714286")
+        self.assertIn("Success: 85.714286% of rows within target", "\n".join(log))
+        self.assertIn("WARNING", "\n".join(log))                    # 2 of 7 rows for manual review
+        # Gemini: 2 attempts per rewritten row, each told how the earlier ones came out; none for tags.
+        self.assertEqual([r.text for r in requests], ["way too long"] * 2 + ["too short"] * 2 + ["stubborn"] * 2)
+        first, second = requests[:2]
+        self.assertEqual((first.duration_ms, first.target_ms, first.previous_attempts), (3000, 2000, ()))
+        self.assertEqual([(a.text, a.duration_ms) for a in second.previous_attempts], [("shorter", 2100)])
+        self.assertEqual(first.context_lines, ("too short", "stubborn", "[Gasps]"))   # Bob's other lines
+        self.assertNotIn("[Gasps]", [r.text for r in requests])
+        self.assertEqual(len(synthesized), 7 + 6)                    # pass 1 + one take per rewrite
         with zipfile.ZipFile(output) as archive:
-            names = set(archive.namelist())
-            lines = sorted(n for n in names if n.startswith("pass2/lines/"))
-            self.assertEqual(lines, ["pass2/lines/ep001_alice_row2.wav", "pass2/lines/ep001_alice_row3.wav", "pass2/lines/ep001_alice_row4.wav",
-                                     "pass2/lines/ep001_bob_row5.wav"])              # one per dubbed row
-            self.assertEqual(sorted(n for n in names if n.startswith("pass2/tracks/")),
-                             ["pass2/tracks/ep001_alice.wav", "pass2/tracks/ep001_bob.wav"])
+            names = archive.namelist()
+            self.assertFalse([n for n in names if n.startswith("pass1/")])
+            self.assertEqual(len([n for n in names if n.startswith("pass1_5/lines/")]), 7)
+            self.assertEqual(len([n for n in names if n.startswith("pass2/lines/")]), 7)
             report = {int(r["excel_row"]): r for r in csv.DictReader(io.StringIO(
                 archive.read("processing_report.csv").decode("utf-8-sig")))}
-            self.assertEqual({row: r["fit_speed"] for row, r in report.items()},
-                             {2: "1.30", 3: "0.80", 4: "1.00", 5: "1.50"})
-            # Fitted lines now speak for (about) their slot; the held line is as fast as allowed.
-            for row, slot in ((2, 2000), (3, 1000)):
-                start, end, _ = speech_span(archive.read(f"pass2/lines/ep001_alice_row{row}.wav"))
-                self.assertAlmostEqual(end - start, slot, delta=40)
-            start, end, _ = speech_span(archive.read("pass2/lines/ep001_bob_row5.wav"))
-            self.assertAlmostEqual(end - start, 4000 / 1.5, delta=40)
-            # A line within the tolerance keeps its pass 1 take (trimmed, not time-stretched).
+            pick = lambda row, *keys: tuple(report[row][k] for k in keys)
+            # Rows within the limits: pass 2 only. Short lines have negative overruns.
+            self.assertEqual(pick(2, "pass1_desired_speed", "pass2_speed", "rewritten", "status"),
+                             ("1.1500000", "1.1500000", "no", "OK"))
+            self.assertEqual(pick(3, "pass1_overrun_ms", "pass1_percent_overrun", "pass2_speed"),
+                             ("-100", "-10.000000", "0.90000000"))
+            self.assertEqual(pick(4, "pass2_speed", "status"), ("1.0000000", "OK"))
             self.assertEqual(archive.read("pass2/lines/ep001_alice_row4.wav"),
-                             archive.read("pass1/lines/ep001_alice_row4.wav"))
-            # Tracks are built from exactly the clips in lines/, at their placements.
+                             archive.read("pass1_5/lines/ep001_alice_row4.wav"))
+            for row, slot in ((2, 2000), (3, 1000)):
+                spoken = speech_span(archive.read(f"pass2/lines/ep001_alice_row{row}.wav"))[1]
+                self.assertAlmostEqual(spoken, slot, delta=40)
+                self.assertEqual(report[row]["leading_trim_ms"], "150")
+            # Rewritten until within 2%: attempt 2 kept, no speed change.
+            self.assertEqual(pick(5, "final_dialogue", "rewritten", "rewrite_attempts", "pass1_desired_speed",
+                                  "pass1_5_desired_speed", "pass2_speed", "status"),
+                             ("shortest", "yes", "2", "1.5000000", "1.0000000", "1.0000000", "OK"))
+            self.assertEqual(speech_span(archive.read("pass1_5/lines/ep001_bob_row5.wav"))[1], 2000)
+            # Rewritten to within the limits: the closer attempt is kept and pass 2 finishes the fit.
+            self.assertEqual(pick(6, "final_dialogue", "pass1_5_desired_speed", "pass2_speed", "status"),
+                             ("padded more", "0.80000000", "0.80000000", "OK"))
+            # Never within the limits: best rewrite kept at 1.0x for manual review.
+            self.assertEqual(pick(7, "final_dialogue", "pass1_5_desired_speed", "pass2_speed", "status"),
+                             ("still long 2", "1.5000000", "1.0000000", "MANUAL_REVIEW"))
+            self.assertIn("kept at 1.0x", report[7]["note"])
+            self.assertEqual(pick(8, "rewrite_attempts", "pass2_speed", "status"), ("0", "1.0000000", "MANUAL_REVIEW"))
+            self.assertIn("tag-only", report[8]["note"])
+            timeline = archive.read("ep001_timeline.csv").decode("utf-8-sig")
+            self.assertIn("Bob: shortest", timeline)
+            self.assertNotIn("way too long", timeline)
+            # Tracks are built from exactly the clips in pass2/lines/, at their placements.
             alice = AudioSegment.from_wav(io.BytesIO(archive.read("pass2/tracks/ep001_alice.wav")))
             line = AudioSegment.from_wav(io.BytesIO(archive.read("pass2/lines/ep001_alice_row3.wav")))
-            start_ms = timecode_to_ms(report[3]["adjusted_start_TCR"])
-            offset = start_ms * 24 * 2   # 24 kHz, 16-bit: compare exact samples, not rounded ms
+            offset = timecode_to_ms(report[3]["adjusted_start_TCR"]) * 24 * 2
             self.assertEqual(alice.raw_data[offset:offset + len(line.raw_data)], line.raw_data)
-            self.assertEqual(int(report[3]["pass2_duration_ms"]), len(line))
-            # Pass 1 is the ElevenLabs take with its 150 ms leading silence trimmed (speech starts at
-            # 0 ms, so at TCR IN); trailing silence is kept. Its tracks are placed by the same rule.
-            for row, text in ((2, "long"), (3, "short"), (4, "fits")):
-                self.assertEqual(report[row]["leading_trim_ms"], "150")
-                start, end, clip_ms = speech_span(archive.read(f"pass1/lines/ep001_alice_row{row}.wav"))
-                self.assertEqual((start, end, clip_ms), (0, speech[text], speech[text] + 200))
-            self.assertEqual(report[5]["leading_trim_ms"], "150")
-            self.assertEqual((int(report[2]["pass1_duration_ms"]), int(report[2]["pass1_overrun_ms"])), (2800, 800))
-            self.assertEqual(int(report[3]["pass1_overrun_ms"]), 0)     # 1.0 s clip (speech + tail) in 1.0 s
-            pass1 = AudioSegment.from_wav(io.BytesIO(archive.read("pass1/tracks/ep001_alice.wav")))
-            first = AudioSegment.from_wav(io.BytesIO(archive.read("pass1/lines/ep001_alice_row2.wav")))
-            self.assertEqual(pass1[:len(first)].raw_data, first.raw_data)
-            # Each pass's tracks end at that pass's last audio (row 4's longer pass 1 take).
-            self.assertEqual(len(pass1), 5000 + 1050 + 200)   # row 4 at 5.0 s: speech, tail (lead trimmed)
+
+    def test_failed_rewrites_keep_the_pass1_take_for_manual_review(self):
+        path = self.workbook([dialogue(start="00:00:00:00", end="00:00:02:00", text="far too long")])
+
+        def rewrite(_request):
+            raise RuntimeError("Gemini returned HTTP 503 (model test)")
+
+        synthesize = Mock(side_effect=lambda *_: self.spoken_clip(4000))
+        summary = run_pipeline(path, self.root / "gemini-down.zip", synthesize=synthesize, rewrite=rewrite,
+                               progress=lambda _: None)
+        self.assertEqual(synthesize.call_count, 1)                   # nothing regenerated
+        self.assertEqual(summary["manual_review_rows"], 1)
+        with zipfile.ZipFile(self.root / "gemini-down.zip") as archive:
+            record = next(csv.DictReader(io.StringIO(archive.read("processing_report.csv").decode("utf-8-sig"))))
+        self.assertEqual((record["rewritten"], record["rewrite_attempts"], record["final_dialogue"], record["status"]),
+                         ("no", "2", "far too long", "MANUAL_REVIEW"))
+        self.assertIn("HTTP 503", record["note"])
+
+    def test_missing_gemini_key_fails_before_any_generation(self):
+        path = self.workbook([dialogue()])
+        synthesize = Mock()
+        with patch("v2.pipeline.GeminiRewriter", side_effect=ValueError("Set GEMINI_API_KEY in v2/.env")):
+            with self.assertRaisesRegex(ValueError, "GEMINI_API_KEY"):
+                run_pipeline(path, self.root / "no-key.zip", synthesize=synthesize)
+        synthesize.assert_not_called()
 
     def test_trim_leading_silence_cuts_only_the_blank_start(self):
         from v2.audio_speed import trim_leading_silence
@@ -571,7 +641,7 @@ class PipelineTests(unittest.TestCase):
     def test_fit_failure_discards_output(self):
         path = self.workbook([dialogue()])
         output = self.root / "failed-fit.zip"
-        with patch("v2.pipeline.fit_to_slot", side_effect=RuntimeError("Audio speed adjustment timed out")):
+        with patch("v2.pipeline.apply_pass2", side_effect=RuntimeError("Audio speed adjustment timed out")):
             with self.assertRaisesRegex(RuntimeError, "Excel row 2: Audio speed adjustment timed out"):
                 run_pipeline(path, output, synthesize=lambda *_: wav_bytes(), progress=lambda _: None)
         self.assertFalse(output.exists())
@@ -589,7 +659,8 @@ class PipelineTests(unittest.TestCase):
         synthesize = Mock(return_value=wav_bytes())
         summary = run_pipeline(path, self.root / "skipped.zip", synthesize=synthesize,
                                progress=lambda _: None)
-        synthesize.assert_called_once_with("Generate this", "alice-voice")
+        # Only the voiced row is generated (its short take is also regenerated by pass 1.5).
+        self.assertEqual({call.args for call in synthesize.call_args_list}, {("Generate this", "alice-voice")})
         self.assertEqual(summary["rows"], 1)
         self.assertEqual(summary["tracks"], 1)
 
