@@ -118,7 +118,7 @@ def create_app(config=None):
     def template():
         workbook = Workbook()
         sheet = workbook.active
-        sheet.title = "English dialogue"
+        sheet.title = "Dubbed dialogue"
         sheet.append(TEMPLATE_HEADERS)
         sheet.freeze_panes = "A2"
         for column in "ABCDEFGH":

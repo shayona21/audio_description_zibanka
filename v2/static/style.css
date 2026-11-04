@@ -636,6 +636,9 @@
         #sheet-name:disabled { background: #f1f2f3; color: var(--muted); }
         .field-help { margin-top: 8px; color: var(--muted); font-size: 12px; }
         .template-note { margin-top: 16px; }
+        .steps { padding-left: 32px; }
+        .steps li + li { margin-top: 4px; }
+        .zip-label { margin-top: 18px; }
         .secondary-button {
             margin-top: 14px; padding: 9px 14px; border: 1px solid var(--line-strong);
             border-radius: 9px; background: var(--surface); color: var(--brand); cursor: pointer;

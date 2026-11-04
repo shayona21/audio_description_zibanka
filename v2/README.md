@@ -1,6 +1,6 @@
 # AD version 2
 
-Independent English dubbing application. V1 files, settings and launch commands are unchanged. Run commands below from the repository root (`audio_description_tool`).
+Independent dubbing application for any language ElevenLabs supports: TARGET DIALOGUE is written in the dubbed language. V1 files, settings and launch commands are unchanged. Run commands below from the repository root (`audio_description_tool`).
 
 ## Setup and launch
 
@@ -18,7 +18,7 @@ Set `ELEVENLABS_API_KEY` and `GEMINI_API_KEY` in `v2/.env`, then run:
 v2/.venv/bin/python -m v2.app
 ```
 
-Open http://127.0.0.1:5071. The original application can continue on port 5070. V2 reads its API key and port from its own `.env` plus environment variables. Model selection is defined only by `MODEL_ID` in `v2/tts_client.py`; environment variables and constructor arguments cannot override it. Every request includes the `VOICE_SETTINGS` from that file: stability 0.5 and similarity boost 0.75. English dialogue is sent verbatim; no translation is performed. The API integration follows the [ElevenLabs create speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
+Open http://127.0.0.1:5071. The original application can continue on port 5070. V2 reads its API key and port from its own `.env` plus environment variables. Model selection is defined only by `MODEL_ID` in `v2/tts_client.py`; environment variables and constructor arguments cannot override it. Every request includes the `VOICE_SETTINGS` from that file: stability 0.5 and similarity boost 0.75. TARGET DIALOGUE is sent verbatim (only a Gemini rewrite in pass 1.5 changes it); no translation is performed. The API integration follows the [ElevenLabs create speech endpoint](https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
 
 **Every take starts on its first sound.** ElevenLabs puts a short, variable stretch of blank audio before the voice (measured 20–180 ms on Billionaire Bhakri episode 1), which made speech start after TCR IN and broke lipsync. Right after each ElevenLabs request, FFmpeg's `silenceremove` finds the first sound (the first 10 ms louder than −60 dBFS; a breath or click counts as sound) and everything before it is cut, on a whole-millisecond boundary, leaving the speech samples untouched. The amount is printed per row and recorded in `processing_report.csv` (`leading_trim_ms`). Trailing silence is kept. Quality Check trims regenerated lines the same way. `measure_leading_silence.py` measures the blank on any run ZIP; on a run made after this change it should report about 0 ms.
 
@@ -91,7 +91,7 @@ Validation runs before speech generation. Requests are sequential and are not au
 ```sh
 v2/.venv/bin/python -m v2.main script.xlsx --validate-only
 v2/.venv/bin/python -m v2.main script.xlsx --output v2/runtime/session01.zip --fps 25
-v2/.venv/bin/python -m v2.main script.xlsx --sheet "English dialogue" --validate-only
+v2/.venv/bin/python -m v2.main script.xlsx --sheet "Dubbed dialogue" --validate-only
 v2/.venv/bin/python -m unittest discover -s v2/tests -v
 ```
 

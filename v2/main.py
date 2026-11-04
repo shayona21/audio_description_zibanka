@@ -9,7 +9,7 @@ from .pipeline import run_pipeline
 
 def main():
     load_dotenv(Path(__file__).with_name(".env"))
-    parser = argparse.ArgumentParser(description="AD version 2: English Excel to episode/character WAV tracks")
+    parser = argparse.ArgumentParser(description="AD version 2: dubbing script (any ElevenLabs language) to episode/character WAV tracks")
     parser.add_argument("workbook", type=Path)
     parser.add_argument("--output", type=Path, default=Path("v2/runtime/AD_v2_output.zip"))
     parser.add_argument("--fps", type=int, choices=SUPPORTED_FPS, default=25)

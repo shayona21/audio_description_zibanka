@@ -1,1 +1,1 @@
-"""Independent standardized English dubbing pipeline."""
+"""Independent dubbing pipeline: any language ElevenLabs supports."""
