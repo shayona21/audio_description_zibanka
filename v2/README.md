@@ -25,8 +25,8 @@ Open http://127.0.0.1:5071. The original application can continue on port 5070. 
 **Three passes fit every line to its slot** (TCR OUT − TCR IN). Limits are set once in `v2/audio_speed.py` (`MIN_SPEED`, `MAX_SPEED`, `NORMAL_TOLERANCE_PERCENT`, `SUCCESS_TARGET_PERCENT`).
 
 - **Pass 1:** ElevenLabs generates every row, the leading silence is trimmed, and the take is measured. Its *audio duration* (the meter) runs from the first sound to the end of speech; trailing silence is not counted. `overrun_ms` = audio − slot (negative when the line is too short), `percent_overrun` = overrun ÷ slot × 100, `desired_speed` = audio ÷ slot with no limits. Speeds and percentages keep 8 significant figures. A row within ±2% is *normal* and is never changed. Pass 1 audio is not in the download.
-- **Pass 1.5:** a row whose desired speed is above 1.2x or below 0.8x is rewritten by Gemini (`v2/rewrite.py`, model `MODEL_ID`) to last its slot at 1.0x, keeping its meaning, tone and character (the character's other lines in the episode are sent for context; `[tags]` are kept exactly), then generated again with ElevenLabs. Up to 2 attempts; the second is told how the first came out. The attempt closest to 1.0x is kept, stopping early once one is within 2%. If the best rewrite is still outside 0.8x–1.2x, or Gemini fails, or the line is tag-only, the row is kept at 1.0x and flagged `MANUAL_REVIEW`. More than 10% of rows flagged prints a warning: that points to a problem earlier in the pipeline. Set `GEMINI_API_KEY` in `v2/.env`.
-- **Pass 2:** FFmpeg's `atempo` applies the desired speed, held between 0.8x and 1.2x, keeping the voice's pitch, to every row that is neither normal nor flagged. Each line is then measured again. The run prints its success rate: the share of rows at most 2% over their slot (shorter lines count as within target), against a target of 90%.
+- **Pass 1.5:** a row whose desired speed is above 1.2x or below 0.8x is rewritten by Gemini (`v2/rewrite.py`, model `MODEL_ID`) to last its slot at 1.0x, keeping its meaning, tone and character (the character's other lines in the episode are sent for context; `[tags]` are kept exactly), then generated again with ElevenLabs. Up to 2 attempts; the second is told how the first came out. The attempt closest to 1.0x is kept, stopping early once one is within 2%. If the best rewrite is still outside 0.8x–1.2x, or Gemini fails, the row is kept at 1.0x and flagged `MANUAL_REVIEW`. A line of one or two words (not counting `[tags]`; tag-only lines count as zero) is never rewritten, because rewriting a word or two loses its meaning in context: it keeps its pass 1 take at 1.0x and is marked `SKIPPED_REWRITE` with the note "skipped AI rewriting due to length". Words are counted by spaces, so languages written without spaces count a whole phrase as one word. More than 10% of rows flagged prints a warning: that points to a problem earlier in the pipeline. Set `GEMINI_API_KEY` in `v2/.env`.
+- **Pass 2:** FFmpeg's `atempo` applies the desired speed, held between 0.8x and 1.2x, keeping the voice's pitch, to every row that is not normal, flagged or skipped. Each line is then measured again. The run prints its success rate: the share of rows at most 2% over their slot (shorter lines count as within target), against a target of 90%.
 
 FFmpeg must be on PATH; a missing FFmpeg or Gemini key is reported before any speech is generated.
 
@@ -57,7 +57,7 @@ The ZIP contains:
 
 | Path | Contents |
 | --- | --- |
-| `pass1_5/lines/ep<episode>_<character>_row<excel row>.wav` | Each dubbed row before the speed change, leading silence trimmed; rewritten rows use the rewritten take |
+| `pass1/lines/ep<episode>_<character>_row<excel row>.wav` | Each dubbed row as ElevenLabs first voiced it, leading silence trimmed; never rewritten or sped up |
 | `pass2/lines/ep<episode>_<character>_row<excel row>.wav` | The same rows after pass 2 (the audio delivered) |
 | `pass2/tracks/ep<episode>_<character>.wav` | One full-length timeline per episode and character, built from the pass 2 lines |
 | `ep<episode>_timeline.csv` | All characters of an episode in adjusted chronological order, with the dialogue actually spoken |
@@ -80,8 +80,8 @@ excel_row,episode,character,voice_id,start_TCR,end_TCR,fps,start_ms,end_ms,tcr_d
 
 - `start_TCR`/`end_TCR` are the script times as `HH:MM:SS:FF` at the run's frame rate (`fps`); `start_ms`/`end_ms` the same in milliseconds; `tcr_duration_ms` is the slot.
 - `final_dialogue` is what is spoken in the delivered audio (the Gemini rewrite when `rewritten` is `yes`). `rewrite_attempts` counts Gemini requests.
-- `pass1_*` describe the first ElevenLabs take, `pass1_5_*` the take kept after pass 1.5, `pass2_*` the delivered audio. `pass2_speed` is the FFmpeg speed applied (`1.0000000` for normal and flagged rows).
-- `status` is `OK`, `TCR_OUT_OVERRUN` (pass 2 audio more than 2% over its slot) or `MANUAL_REVIEW`; `note` says why a row was flagged.
+- `pass1_*` describe the first ElevenLabs take (`pass1/lines/`), `pass1_5_*` the take kept after pass 1.5 (measurements only; that audio is not in the ZIP), `pass2_*` the delivered audio. `pass2_speed` is the FFmpeg speed applied (`1.0000000` for normal, flagged and skipped rows).
+- `status` is `OK`, `TCR_OUT_OVERRUN` (pass 2 audio more than 2% over its slot), `MANUAL_REVIEW` or `SKIPPED_REWRITE` (one or two words, not rewritten); `note` says why.
 - `adjusted_start_TCR` and `adjusted_end_TCR` show the actual placement and the end of the pass 2 clip. TCR display rounds to the nearest frame (half-frame ties round up); audio placement stays in milliseconds.
 
 Validation runs before speech generation. Requests are sequential and are not automatically retried: retrying after a provider failure can incur additional charges for already generated rows. A failed run produces no completed ZIP and discards temporary audio. API voice availability is checked by ElevenLabs during generation. No live API calls are needed for tests: ElevenLabs and Gemini are replaced by fakes.

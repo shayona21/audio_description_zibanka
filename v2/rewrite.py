@@ -69,6 +69,12 @@ def has_spoken_words(text):
     return bool(re.search(r"\w", TAG_PATTERN.sub("", text)))
 
 
+def word_count(text):
+    """Spoken words, split on spaces, ignoring [tags] and stray punctuation: "[Angry] Get out!" has 2.
+    Languages written without spaces (Chinese, Japanese, Thai) count a whole phrase as one word."""
+    return sum(1 for word in TAG_PATTERN.sub(" ", text).split() if re.search(r"\w", word))
+
+
 def seconds(ms):
     return f"{ms / 1000:.2f} s"
 

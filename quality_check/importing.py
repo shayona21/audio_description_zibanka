@@ -1,15 +1,18 @@
 """Read an AD version 2 output ZIP so one of its episodes can be reviewed without dubbing it again.
 
-Only two things in the ZIP are used:
+Only these are used from the ZIP:
 
   processing_report.csv   one record per row: its timing in ms, frame rate, character, voice, the
                           script's dialogue and the dialogue spoken (a Gemini rewrite or the same),
                           and the pass 2 speed
-  pass1_5/lines/          each row's take before the speed change
+  pass1/lines/            the take of every row that was not rewritten (ElevenLabs, trimmed)
+  pass2/lines/            the take of every row Gemini rewrote (the rewritten take before its speed
+                          change is not in the ZIP, so the delivered clip becomes the take, at 1.0x)
 
 Everything needed to place a line is in the report, so the workbook is not read: no worksheet or
-frame-rate settings are needed. The take is kept as the line's take, and the clip that plays is the
-take at the report's pass 2 speed (the same FFmpeg call V2 made, so it matches V2's pass 2 audio).
+frame-rate settings are needed. The clip that plays is the take at its speed: for a row that was
+not rewritten, the report's pass 2 speed (the same FFmpeg call V2 made, so it matches V2's pass 2
+audio); for a rewritten row, 1.0x, which is V2's pass 2 clip itself.
 The session rebuilds the tracks from these clips with V2's rule. The ZIP's script.xlsx is copied
 only so the export can write reviewed lines back into it.
 """
@@ -20,14 +23,16 @@ from pathlib import Path
 import zipfile
 
 from v2.audio_builder import read_clip
-from v2.exporter import LINES_DIR, PASS1_5_DIR, SCRIPT_NAME, line_name
+from v2.audio_speed import sig
+from v2.exporter import LINES_DIR, PASS1_DIR, PASS2_DIR, SCRIPT_NAME, line_name
 from v2.models import DialogueRow
 
 REPORT_NAME = "processing_report.csv"
 REQUIRED_FIELDS = ("excel_row", "episode", "character", "voice_id", "fps", "start_ms", "end_ms",
                    "original_dialogue", "final_dialogue", "rewritten", "rewrite_attempts", "leading_trim_ms",
                    "pass1_audio_duration_ms", "pass1_overrun_ms", "pass1_percent_overrun", "pass1_desired_speed",
-                   "pass1_5_desired_speed", "pass2_speed", "status", "note")
+                   "pass1_5_desired_speed", "pass2_speed", "pass2_audio_duration_ms", "tcr_duration_ms",
+                   "status", "note")
 REMAKE = "Run the script through AD Tool V2 again and use the new ZIP."
 
 
@@ -46,8 +51,10 @@ class V2Run:
             raise RunError("This file is not a ZIP. Upload the ZIP that AD Tool V2 delivered.") from None
         try:
             names = set(self.archive.namelist())
-            if REPORT_NAME not in names or not any(n.startswith(f"{PASS1_5_DIR}/{LINES_DIR}/") for n in names):
-                raise RunError(f"This ZIP has no pass1_5 line clips, so it was made by an earlier AD Tool V2. {REMAKE}")
+            if REPORT_NAME not in names or not all(any(n.startswith(f"{folder}/{LINES_DIR}/") for n in names)
+                                                   for folder in (PASS1_DIR, PASS2_DIR)):
+                raise RunError(f"This ZIP has no pass1 and pass2 line clips, so it was made by an earlier "
+                               f"AD Tool V2. {REMAKE}")
             self.records = self._read_report()
             self.fps = self.records[0]["fps"]
             self.rows = [DialogueRow(r["excel_row"], r["episode"], r["character"], r["start_ms"], r["end_ms"],
@@ -75,7 +82,7 @@ class V2Run:
         try:
             for record in reader:
                 record = {key: unquote(value) for key, value in record.items()}
-                for key in ("excel_row", "fps", "start_ms", "end_ms"):
+                for key in ("excel_row", "fps", "start_ms", "end_ms", "pass2_audio_duration_ms", "tcr_duration_ms"):
                     record[key] = int(record[key])
                 for key in ("pass1_5_desired_speed", "pass2_speed"):
                     record[key] = float(record[key])
@@ -105,8 +112,12 @@ class V2Run:
         takes = {}
         for row in rows:
             r = self.by_row[row.row_number]
+            if rewritten(r):   # the take is V2's pass 2 clip: it plays at 1.0x
+                fit, needed = 1.0, sig(r["pass2_audio_duration_ms"] / r["tcr_duration_ms"])
+            else:
+                fit, needed = r["pass2_speed"], r["pass1_5_desired_speed"]
             takes[row.row_number] = {
-                "fit_speed": r["pass2_speed"], "needed_speed": r["pass1_5_desired_speed"],
+                "fit_speed": fit, "needed_speed": needed,
                 "status": r["status"], "note": r["note"], "rewrite_attempts": r["rewrite_attempts"],
                 "leading_trim_ms": r["leading_trim_ms"],
                 "pass1": {key: r[f"pass1_{key}"] for key in
@@ -124,11 +135,13 @@ class V2Run:
         return edits
 
     def clips(self, rows):
-        """Each row's take bytes, checked; every row with a missing or unreadable clip is reported at once."""
+        """Each row's take bytes (pass 1, or pass 2 for a rewritten row), checked; every row with a
+        missing or unreadable clip is reported at once."""
         clips, missing = {}, []
         for row in rows:
+            folder = PASS2_DIR if rewritten(self.by_row[row.row_number]) else PASS1_DIR
             try:
-                data = self.archive.read(f"{PASS1_5_DIR}/{LINES_DIR}/{line_name(row)}")
+                data = self.archive.read(f"{folder}/{LINES_DIR}/{line_name(row)}")
                 read_clip(data)
                 clips[row.row_number] = data
             except Exception:  # not in the ZIP, or not a WAV
@@ -142,6 +155,11 @@ class V2Run:
     def save_script(self, target):
         if self.script is not None:
             Path(target).write_bytes(self.script)
+
+
+def rewritten(record):
+    """Pass 1.5 kept a new take (even if Gemini's words happened to match the script's)."""
+    return record["rewritten"] == "yes"
 
 
 def unquote(value):

@@ -139,7 +139,7 @@ async function pollStatus() {
             setProgress(100);
             byId('download-link').href = `/download/${activeJob}`;
             byId('output-file-name').textContent = data.download_name || 'AD_v2_output.zip';
-            byId('review-summary').textContent = `${data.success_percent}% of rows within target ${data.success ? '✅' : '❌'} · ${data.tracks} tracks · ${data.rewritten_rows} rows rewritten · ${data.fitted_rows} rows sped up or slowed down · ${data.manual_review_rows} rows for manual review · ${data.overrun_rows} rows over TCR OUT`;
+            byId('review-summary').textContent = `${data.success_percent}% of rows within target ${data.success ? '✅' : '❌'} · ${data.tracks} tracks · ${data.rewritten_rows} rows rewritten · ${data.fitted_rows} rows sped up or slowed down · ${data.manual_review_rows} rows for manual review · ${data.skipped_rows} short rows not rewritten · ${data.overrun_rows} rows over TCR OUT`;
             downloadSection.style.display = 'block';
             rememberJob(null);
             activeJob = null;

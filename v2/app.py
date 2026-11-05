@@ -202,7 +202,7 @@ def create_app(config=None):
                                        progress=jobs[job_id]["progress"].append,
                                        progress_state=lambda state: jobs[job_id].update(state))
                 jobs[job_id].update({key: summary[key] for key in (
-                                        "flagged_rows", "fitted_rows", "rewritten_rows", "manual_review_rows",
+                                        "flagged_rows", "fitted_rows", "rewritten_rows", "manual_review_rows", "skipped_rows",
                                         "overrun_rows", "success_percent", "success")})
                 jobs[job_id].update(status="done", percent=100, phase="Complete")
                 write_run_record(job_dir, dict(record, status="done", finished=time.time(),

@@ -10,9 +10,8 @@ def safe_component(value):
 
 
 # ZIP layout. Quality Check reads these names when it imports a run, so keep both tools in step.
-PASS1_DIR = "pass1"            # older runs only: no longer in the ZIP (Quality Check still reads it until updated)
-PASS1_5_DIR = "pass1_5"        # each trimmed take; rows rewritten by Gemini use the rewritten take
-PASS2_DIR = "pass2"            # each line fitted to its slot with FFmpeg (what is delivered)
+PASS1_DIR = "pass1"            # the ElevenLabs dub as delivered, leading silence trimmed (never rewritten or sped up)
+PASS2_DIR = "pass2"            # the delivered audio: rewritten where needed, then fitted to its slot with FFmpeg
 TRACKS_DIR = "tracks"          # in each pass: one full-length timeline WAV per <character, episode>
 LINES_DIR = "lines"            # in each pass: one WAV per dubbed row
 SCRIPT_NAME = "script.xlsx"    # copy of the input workbook

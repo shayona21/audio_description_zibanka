@@ -72,18 +72,21 @@ here, newest first (30 at most). If AD Tool V2 runs from a different folder than
 `AD_V2_RUNTIME_DIR` to its `v2/runtime` folder. A run made elsewhere can be uploaded as its ZIP instead (kept 24
 hours). After picking the run and the episode:
 
-- Only two things in the ZIP are read: `processing_report.csv` and `pass1_5/lines/`
+- Only these are read from the ZIP: `processing_report.csv`, `pass1/lines/` and `pass2/lines/`
   (`ep<episode>_<character>_row<row>.wav`, the names from `v2.exporter.line_name`). The report gives
   each row's timing in milliseconds, frame rate, character, voice, script wording, the dialogue spoken
   and the pass 2 speed, so the workbook is not parsed and no frame rate or worksheet is asked for.
   Every clip is checked first; a missing one is reported by Excel row before anything is stored.
-- Each pass 1.5 clip becomes the line's take; what plays is that take at the report's pass 2 speed
-  (the same FFmpeg call AD Tool V2 made, so V2's pass 2 audio exactly). The tracks are rebuilt from
-  these clips with V2's rule, sample-identical to `pass2/tracks/` (a test checks this).
+- A row that was not rewritten takes its pass 1 clip as the take and plays it at the report's pass 2
+  speed (the same FFmpeg call AD Tool V2 made, so V2's pass 2 audio exactly). A row Gemini rewrote
+  takes its pass 2 clip as the take, at 1.0x: the rewritten take before its speed change is not in the
+  ZIP, so moving that line's speed slider changes the delivered clip's speed again. The tracks are
+  rebuilt with V2's rule, sample-identical to `pass2/tracks/` (a test checks this).
 - Lines Gemini rewrote show as edited lines, with the script's wording beside them. Lines AD Tool V2
-  marked `MANUAL_REVIEW` keep its note, and the review lists how many there are.
+  marked `MANUAL_REVIEW` or `SKIPPED_REWRITE` (one or two words, not rewritten) keep their note, and
+  the review lists how many there are.
 - The ZIP's `script.xlsx` is kept only so the export can write changed lines back into it.
-- ZIPs from an earlier AD Tool V2 (no `pass1_5/lines/`, or an older report) are refused with a
+- ZIPs from an earlier AD Tool V2 (no `pass1/lines/` and `pass2/lines/`, or an older report) are refused with a
   message to run the script again.
 - Editing a line's words still makes one ElevenLabs request for that line, fitted like the rest.
 ## Script panel and subtitles (Block 4)

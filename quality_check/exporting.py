@@ -108,7 +108,8 @@ def build_export(folder, record, rows, out_path):
             measured_take = {f"pass1_5_{k}": v for k, v in fields(line).items()}
             pass1 = info.get("pass1") or fields(line)   # generated here: the take is the first take
             reviewed = key in speeds
-            status = ("MANUAL_REVIEW" if info.get("status") == "MANUAL_REVIEW" and not reviewed
+            kept = info.get("status") if info.get("status") in ("MANUAL_REVIEW", "SKIPPED_REWRITE") else None
+            status = (kept if kept and not reviewed
                       else "OK" if played.within_target else "TCR_OUT_OVERRUN")
             original = edits[key]["original"] if key in edits else row.text
             records.append(dict(excel_row=row.row_number, episode=row.episode, character=row.character,

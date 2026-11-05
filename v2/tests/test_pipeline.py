@@ -141,7 +141,7 @@ class PipelineTests(unittest.TestCase):
                      "lines/ep001_alice_row2.wav", "lines/ep001_bob_row3.wav", "lines/ep001_alice_row4.wav",
                      "lines/ep002_alice_row5.wav"}
             lines = {name for name in audio if name.startswith("lines/")}
-            self.assertEqual(set(archive.namelist()), {f"pass1_5/{name}" for name in lines} | {f"pass2/{name}" for name in audio} | {
+            self.assertEqual(set(archive.namelist()), {f"pass1/{name}" for name in lines} | {f"pass2/{name}" for name in audio} | {
                 "ep001_timeline.csv", "ep002_timeline.csv", "processing_report.csv", "script.xlsx"})
             self.assertEqual(archive.read("script.xlsx"), path.read_bytes())
             for name in ("ep001_alice.wav", "ep001_bob.wav"):
@@ -454,16 +454,19 @@ class PipelineTests(unittest.TestCase):
             dialogue(start="00:00:00:00", end="00:00:02:00", text="long"),               # 1.15x: pass 2 only
             dialogue(start="00:00:03:00", end="00:00:04:00", text="short"),              # 0.90x: pass 2 only
             dialogue(start="00:00:05:00", end="00:00:06:00", text="fits"),               # within 2%: untouched
-            dialogue(**bob, start="00:00:00:00", end="00:00:02:00", text="way too long"),   # 1.5x: rewritten
-            dialogue(**bob, start="00:00:03:00", end="00:00:05:00", text="too short"),      # 0.2x: rewritten
-            dialogue(**bob, start="00:00:06:00", end="00:00:08:00", text="stubborn"),       # 2.5x: rewrites fail
-            dialogue(**bob, start="00:00:09:00", end="00:00:11:00", text="[Gasps]"),        # tag-only
+            dialogue(**bob, start="00:00:00:00", end="00:00:02:00", text="way too long"),          # 1.5x: rewritten
+            dialogue(**bob, start="00:00:03:00", end="00:00:05:00", text="much too short here"),   # 0.2x: rewritten
+            dialogue(**bob, start="00:00:06:00", end="00:00:08:00", text="this one is stubborn"),  # 2.5x: rewrites fail
+            dialogue(**bob, start="00:00:09:00", end="00:00:11:00", text="[Gasps]"),        # no words: skipped
+            dialogue(**bob, start="00:00:12:00", end="00:00:14:00", text="[Angry] Get out!"),  # 2 words, 1.5x: skipped
+            dialogue(**bob, start="00:00:16:00", end="00:00:18:00", text="No."),             # 1 word, 0.2x: skipped
         ])
         speech = {"long": 2300, "short": 900, "fits": 1010, "way too long": 3000, "shorter": 2100,
-                  "shortest": 2000, "too short": 400, "padded": 1500, "padded more": 1600, "stubborn": 5000,
-                  "still long": 4000, "still long 2": 3000, "[Gasps]": 500}
-        rewrites = {"way too long": ["shorter", "shortest"], "too short": ["padded", "padded more"],
-                    "stubborn": ["still long", "still long 2"]}
+                  "shortest": 2000, "much too short here": 400, "padded": 1500, "padded more": 1600,
+                  "this one is stubborn": 5000, "still long": 4000, "still long 2": 3000, "[Gasps]": 500,
+                  "[Angry] Get out!": 3000, "No.": 400}
+        rewrites = {"way too long": ["shorter", "shortest"], "much too short here": ["padded", "padded more"],
+                    "this one is stubborn": ["still long", "still long 2"]}
         requests = []
 
         def rewrite(request):
@@ -479,24 +482,29 @@ class PipelineTests(unittest.TestCase):
         output = self.root / "rewritten.zip"
         log = []
         summary = run_pipeline(path, output, synthesize=synthesize, rewrite=rewrite, progress=log.append)
-        self.assertEqual((summary["rewritten_rows"], summary["manual_review_rows"], summary["fitted_rows"]), (3, 2, 3))
-        self.assertFalse(summary["success"])                         # 6 of 7 within target
-        self.assertEqual(summary["success_percent"], "85.714286")
-        self.assertIn("Success: 85.714286% of rows within target", "\n".join(log))
-        self.assertIn("WARNING", "\n".join(log))                    # 2 of 7 rows for manual review
-        # Gemini: 2 attempts per rewritten row, each told how the earlier ones came out; none for tags.
-        self.assertEqual([r.text for r in requests], ["way too long"] * 2 + ["too short"] * 2 + ["stubborn"] * 2)
+        self.assertEqual((summary["rewritten_rows"], summary["manual_review_rows"], summary["skipped_rows"],
+                          summary["fitted_rows"]), (3, 1, 3, 3))
+        self.assertFalse(summary["success"])                         # 7 of 9 within target
+        self.assertEqual(summary["success_percent"], "77.777778")
+        self.assertIn("Success: 77.777778% of rows within target", "\n".join(log))
+        self.assertIn("3 short rows not rewritten (SKIPPED_REWRITE)", "\n".join(log))
+        self.assertIn("WARNING", "\n".join(log))                    # 1 of 9 rows (11%) for manual review
+        # Gemini: 2 attempts per rewritten row, each told how the earlier ones came out. Lines of one or
+        # two words (or only tags) are never sent, whether too long or too short.
+        self.assertEqual([r.text for r in requests],
+                         ["way too long"] * 2 + ["much too short here"] * 2 + ["this one is stubborn"] * 2)
         first, second = requests[:2]
         self.assertEqual((first.duration_ms, first.target_ms, first.previous_attempts), (3000, 2000, ()))
         self.assertEqual([(a.text, a.duration_ms) for a in second.previous_attempts], [("shorter", 2100)])
-        self.assertEqual(first.context_lines, ("too short", "stubborn", "[Gasps]"))   # Bob's other lines
-        self.assertNotIn("[Gasps]", [r.text for r in requests])
-        self.assertEqual(len(synthesized), 7 + 6)                    # pass 1 + one take per rewrite
+        self.assertEqual(first.context_lines,                      # Bob's other lines
+                         ("much too short here", "this one is stubborn", "[Gasps]", "[Angry] Get out!", "No."))
+        self.assertEqual(len(synthesized), 9 + 6)                    # pass 1 + one take per rewrite
         with zipfile.ZipFile(output) as archive:
             names = archive.namelist()
-            self.assertFalse([n for n in names if n.startswith("pass1/")])
-            self.assertEqual(len([n for n in names if n.startswith("pass1_5/lines/")]), 7)
-            self.assertEqual(len([n for n in names if n.startswith("pass2/lines/")]), 7)
+            self.assertFalse([n for n in names if n.startswith("pass1_5/")])     # not in the download
+            self.assertEqual(len([n for n in names if n.startswith("pass1/lines/")]), 9)
+            self.assertEqual(len([n for n in names if n.startswith("pass2/lines/")]), 9)
+            self.assertEqual(len([n for n in names if n.startswith("pass2/tracks/")]), 2)
             report = {int(r["excel_row"]): r for r in csv.DictReader(io.StringIO(
                 archive.read("processing_report.csv").decode("utf-8-sig")))}
             pick = lambda row, *keys: tuple(report[row][k] for k in keys)
@@ -507,16 +515,17 @@ class PipelineTests(unittest.TestCase):
                              ("-100", "-10.000000", "0.90000000"))
             self.assertEqual(pick(4, "pass2_speed", "status"), ("1.0000000", "OK"))
             self.assertEqual(archive.read("pass2/lines/ep001_alice_row4.wav"),
-                             archive.read("pass1_5/lines/ep001_alice_row4.wav"))
+                             archive.read("pass1/lines/ep001_alice_row4.wav"))
             for row, slot in ((2, 2000), (3, 1000)):
                 spoken = speech_span(archive.read(f"pass2/lines/ep001_alice_row{row}.wav"))[1]
                 self.assertAlmostEqual(spoken, slot, delta=40)
                 self.assertEqual(report[row]["leading_trim_ms"], "150")
-            # Rewritten until within 2%: attempt 2 kept, no speed change.
+            # Rewritten until within 2%: attempt 2 kept, no speed change. Pass 1 keeps the original dub.
             self.assertEqual(pick(5, "final_dialogue", "rewritten", "rewrite_attempts", "pass1_desired_speed",
                                   "pass1_5_desired_speed", "pass2_speed", "status"),
                              ("shortest", "yes", "2", "1.5000000", "1.0000000", "1.0000000", "OK"))
-            self.assertEqual(speech_span(archive.read("pass1_5/lines/ep001_bob_row5.wav"))[1], 2000)
+            self.assertEqual(speech_span(archive.read("pass2/lines/ep001_bob_row5.wav"))[1], 2000)
+            self.assertEqual(speech_span(archive.read("pass1/lines/ep001_bob_row5.wav"))[1], 3000)
             # Rewritten to within the limits: the closer attempt is kept and pass 2 finishes the fit.
             self.assertEqual(pick(6, "final_dialogue", "pass1_5_desired_speed", "pass2_speed", "status"),
                              ("padded more", "0.80000000", "0.80000000", "OK"))
@@ -524,8 +533,13 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(pick(7, "final_dialogue", "pass1_5_desired_speed", "pass2_speed", "status"),
                              ("still long 2", "1.5000000", "1.0000000", "MANUAL_REVIEW"))
             self.assertIn("kept at 1.0x", report[7]["note"])
-            self.assertEqual(pick(8, "rewrite_attempts", "pass2_speed", "status"), ("0", "1.0000000", "MANUAL_REVIEW"))
-            self.assertIn("tag-only", report[8]["note"])
+            # One or two words (or none): not rewritten, kept at 1.0x, too long or too short alike.
+            for row, text in ((8, "[Gasps]"), (9, "[Angry] Get out!"), (10, "No.")):
+                self.assertEqual(pick(row, "final_dialogue", "rewritten", "rewrite_attempts", "pass2_speed", "status",
+                                      "note"),
+                                 (text, "no", "0", "1.0000000", "SKIPPED_REWRITE", "skipped AI rewriting due to length"))
+                self.assertEqual(archive.read(f"pass2/lines/ep001_bob_row{row}.wav"),
+                                 archive.read(f"pass1/lines/ep001_bob_row{row}.wav"))
             timeline = archive.read("ep001_timeline.csv").decode("utf-8-sig")
             self.assertIn("Bob: shortest", timeline)
             self.assertNotIn("way too long", timeline)

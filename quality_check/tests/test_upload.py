@@ -205,11 +205,13 @@ class DubbingTests(unittest.TestCase):
         folder = self.runtime / sid
         lines = {line["row"]: line for line in record["audio"]["lines"]}
         # Row 6 needs 0.81x: within the limits, so pass 2 slows it. Rows 2-5 need more than the
-        # limits allow: they stay at 1.0x and are marked for the reviewer to rewrite.
+        # limits allow: they stay at 1.0x and are marked for the reviewer to rewrite, or, for
+        # "Stop!" (one word), marked as a short line that is not rewritten.
         self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
                          {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 0.81})
         self.assertEqual({row: line["status"] for row, line in lines.items()},
-                         {2: "MANUAL_REVIEW", 3: "MANUAL_REVIEW", 4: "MANUAL_REVIEW", 5: "MANUAL_REVIEW", 6: ""})
+                         {2: "MANUAL_REVIEW", 3: "MANUAL_REVIEW", 4: "MANUAL_REVIEW", 5: "SKIPPED_REWRITE", 6: ""})
+        self.assertEqual(lines[5]["note"], "skipped AI rewriting due to length")
         self.assertEqual(lines[4]["needed_speed"], 2.16)                    # unlimited, 8 significant figures
         self.assertTrue(any("manual review" in w for w in record["audio"]["warnings"]))
         for row, line in lines.items():
@@ -257,8 +259,9 @@ class DubbingTests(unittest.TestCase):
         self.assertEqual(body["changed_tracks"], [1])                 # AMRITA only
         self.assertEqual(self.track_bytes(sid, 0), kuhu_before)       # KUHU's file untouched
         new = {l["row"]: l for l in body["audio"]["lines"]}
-        # The new take gets the same rule: far too short even at 0.8x, so 1.0x and marked for review.
-        self.assertEqual((new[3]["fit_speed"], new[3]["status"]), (1.0, "MANUAL_REVIEW"))
+        # The new take gets the same rule: far too short even at 0.8x, and only one word, so 1.0x and
+        # marked as a short line that is not rewritten.
+        self.assertEqual((new[3]["fit_speed"], new[3]["status"]), (1.0, "SKIPPED_REWRITE"))
         self.assertAlmostEqual(new[3]["audio_end_ms"] - new[3]["audio_start_ms"], natural_ms("Out!"), delta=30)
         self.assertTrue(new[3]["edited"])
         self.assertEqual(new[3]["original"], lines[3]["text"])
@@ -528,26 +531,30 @@ class ImportTests(unittest.TestCase):
                     expected = wav.readframes(wav.getnframes())
                 with wave.open(str(folder / "tracks" / f"{track['index']}.wav")) as wav:
                     self.assertEqual(wav.readframes(wav.getnframes()), expected, track["character"])
-            # The take is V2's pass 1.5 clip; what plays is that take at the report's speed, which
-            # is exactly V2's pass 2 clip (row 6 was slowed to 0.81x).
-            for row, name in ((4, "ep1_kuhu_row4.wav"), (6, "ep1_amrita_row6.wav")):
-                self.assertEqual((folder / "clips" / f"{row}.take.wav").read_bytes(), archive.read(f"pass1_5/lines/{name}"))
-                self.assertEqual((folder / "clips" / f"{row}.wav").read_bytes(), archive.read(f"pass2/lines/{name}"))
+            # A row that was not rewritten takes its pass 1 clip and plays it at the report's speed,
+            # which is exactly V2's pass 2 clip (row 6 was slowed to 0.81x). A rewritten row (row 4)
+            # takes V2's pass 2 clip and plays it as it is. pass1_5/ is not in the ZIP.
+            self.assertFalse([n for n in archive.namelist() if n.startswith("pass1_5/")])
+            name4, name6 = "ep1_kuhu_row4.wav", "ep1_amrita_row6.wav"
+            self.assertEqual((folder / "clips" / "6.take.wav").read_bytes(), archive.read(f"pass1/lines/{name6}"))
+            self.assertEqual((folder / "clips" / "6.wav").read_bytes(), archive.read(f"pass2/lines/{name6}"))
+            self.assertEqual((folder / "clips" / "4.take.wav").read_bytes(), archive.read(f"pass2/lines/{name4}"))
+            self.assertEqual((folder / "clips" / "4.wav").read_bytes(), archive.read(f"pass2/lines/{name4}"))
         lines = {line["row"]: line for line in record["audio"]["lines"]}
         self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
                          {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 0.81})     # from V2's report
         self.assertEqual(lines[4]["needed_speed"], 0.99)                 # the rewrite's own speed
-        # Gemini's rewrites play and show as edits beside the script's wording; row 5's rewrite
-        # still does not fit, so it is marked for manual review.
+        # Gemini's rewrites play and show as edits beside the script's wording. Row 5 ("Stop!") is one
+        # word, so AD Tool V2 did not rewrite it.
         self.assertEqual((lines[4]["edited"], lines[4]["edited_by"], lines[4]["original"]),
                          (True, "gemini", ONE_EPISODE[2][6]))
         self.assertTrue(lines[4]["text"].startswith("[Gasps] "))
         self.assertEqual((lines[6]["edited"], lines[6]["text"]), (False, ONE_EPISODE[4][6]))
-        self.assertEqual(lines[5]["status"], "MANUAL_REVIEW")
-        self.assertIn("kept at 1.0x", lines[5]["note"])
+        self.assertEqual((lines[5]["status"], lines[5]["note"], lines[5]["edited"]),
+                         ("SKIPPED_REWRITE", "skipped AI rewriting due to length", False))
         warnings = " ".join(record["audio"]["warnings"])
         self.assertIn("rewritten by Gemini", warnings)
-        self.assertIn("manual review", warnings)
+        self.assertIn("not rewritten (SKIPPED_REWRITE)", warnings)
 
     def test_imported_line_speed_is_measured_from_the_natural_take(self):
         record = self.wait(self.start(self.server_run()).get_json()["session_id"])
@@ -606,7 +613,7 @@ class ImportTests(unittest.TestCase):
         self.assertIn("earlier AD Tool V2", response.get_json()["error"])
         old = io.BytesIO()
         with zipfile.ZipFile(old, "w") as archive:          # line clips, but a report from before pass 1.5
-            archive.writestr("pass1_5/lines/ep1_kuhu_row2.wav", b"RIFF")
+            archive.writestr("pass1_5/lines/ep1_kuhu_row2.wav", b"RIFF")    # the layout before pass1/ came back
             archive.writestr("processing_report.csv", "excel_row,episode,duration,fit_speed\n2,1,1000,1.00\n")
         response = upload(old.getvalue())
         self.assertEqual(response.status_code, 400)
@@ -620,7 +627,7 @@ class ImportTests(unittest.TestCase):
         # A clip missing from the ZIP is reported by row before anything is stored.
         path = self.v2_runtime / run_id / "AD_v2_output.zip"
         with zipfile.ZipFile(path) as archive:
-            items = {name: archive.read(name) for name in archive.namelist() if name != "pass1_5/lines/ep1_amrita_row3.wav"}
+            items = {name: archive.read(name) for name in archive.namelist() if name != "pass2/lines/ep1_amrita_row3.wav"}
         with zipfile.ZipFile(path, "w") as archive:
             for name, data in items.items():
                 archive.writestr(name, data)

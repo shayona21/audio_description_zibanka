@@ -92,14 +92,16 @@
                             (<a href="https://elevenlabs.io/voice-library" target="_blank" rel="noopener noreferrer">Voice Library</a>).
                             Silence before the voice is cut, so speech starts on TCR IN.</li>
                         <li><b>Rewrite:</b> if a line would need faster than 1.2x or slower than 0.8x to fit,
-                            Gemini rewrites it with the same meaning, tone and character, and it is voiced again (up to 2 tries).</li>
+                            Gemini rewrites it with the same meaning, tone and character, and it is voiced again (up to 2 tries).
+                            Lines of one or two words are not rewritten: they stay at 1.0x, marked <b>SKIPPED_REWRITE</b>.</li>
                         <li><b>Speed:</b> lines more than 2% off are sped up or slowed down, 0.8x–1.2x, pitch kept.
                             Lines that still don't fit stay at 1.0x and are marked <b>MANUAL_REVIEW</b>.</li>
                     </ol>
                     <p class="field-label zip-label">In the ZIP</p>
                     <ul class="voice-preview-note steps">
                         <li><b>pass2/tracks/</b>: one WAV per episode and character, the final audio</li>
-                        <li><b>pass2/lines/</b> and <b>pass1_5/lines/</b>: each line after and before the speed change</li>
+                        <li><b>pass2/lines/</b>: each line as delivered (rewritten and sped up where needed)</li>
+                        <li><b>pass1/lines/</b>: each line as ElevenLabs first voiced it, before any rewrite or speed change</li>
                         <li><b>processing_report.csv</b>: per line timings, speed, rewrite and status; plus a timeline CSV per episode and the script</li>
                     </ul>
                     <p class="field-help">A line starts on its TCR IN, or straight after the same character's previous line if that one runs late.

@@ -1,0 +1,726 @@
+diff --git a/quality_check/README.md b/quality_check/README.md
+index 542a6d0..762ffc9 100644
+--- a/quality_check/README.md
++++ b/quality_check/README.md
+@@ -72,18 +72,21 @@ here, newest first (30 at most). If AD Tool V2 runs from a different folder than
+ `AD_V2_RUNTIME_DIR` to its `v2/runtime` folder. A run made elsewhere can be uploaded as its ZIP instead (kept 24
+ hours). After picking the run and the episode:
+ 
+-- Only two things in the ZIP are read: `processing_report.csv` and `pass1_5/lines/`
++- Only these are read from the ZIP: `processing_report.csv`, `pass1/lines/` and `pass2/lines/`
+   (`ep<episode>_<character>_row<row>.wav`, the names from `v2.exporter.line_name`). The report gives
+   each row's timing in milliseconds, frame rate, character, voice, script wording, the dialogue spoken
+   and the pass 2 speed, so the workbook is not parsed and no frame rate or worksheet is asked for.
+   Every clip is checked first; a missing one is reported by Excel row before anything is stored.
+-- Each pass 1.5 clip becomes the line's take; what plays is that take at the report's pass 2 speed
+-  (the same FFmpeg call AD Tool V2 made, so V2's pass 2 audio exactly). The tracks are rebuilt from
+-  these clips with V2's rule, sample-identical to `pass2/tracks/` (a test checks this).
++- A row that was not rewritten takes its pass 1 clip as the take and plays it at the report's pass 2
++  speed (the same FFmpeg call AD Tool V2 made, so V2's pass 2 audio exactly). A row Gemini rewrote
++  takes its pass 2 clip as the take, at 1.0x: the rewritten take before its speed change is not in the
++  ZIP, so moving that line's speed slider changes the delivered clip's speed again. The tracks are
++  rebuilt with V2's rule, sample-identical to `pass2/tracks/` (a test checks this).
+ - Lines Gemini rewrote show as edited lines, with the script's wording beside them. Lines AD Tool V2
+-  marked `MANUAL_REVIEW` keep its note, and the review lists how many there are.
++  marked `MANUAL_REVIEW` or `SKIPPED_REWRITE` (one or two words, not rewritten) keep their note, and
++  the review lists how many there are.
+ - The ZIP's `script.xlsx` is kept only so the export can write changed lines back into it.
+-- ZIPs from an earlier AD Tool V2 (no `pass1_5/lines/`, or an older report) are refused with a
++- ZIPs from an earlier AD Tool V2 (no `pass1/lines/` and `pass2/lines/`, or an older report) are refused with a
+   message to run the script again.
+ - Editing a line's words still makes one ElevenLabs request for that line, fitted like the rest.
+ ## Script panel and subtitles (Block 4)
+diff --git a/quality_check/app.py b/quality_check/app.py
+index 740553f..59cc453 100644
+--- a/quality_check/app.py
++++ b/quality_check/app.py
+@@ -149,11 +149,16 @@ def create_app(config=None):
+                                   line_speed=line_speed_of(record, key),
+                                   speed_set=key in (record.get("line_speeds") or {})))
+             flagged = sum(line["status"] == "MANUAL_REVIEW" for line in lines)
++            skipped = sum(line["status"] == "SKIPPED_REWRITE" for line in lines)
+             rewritten = sum(line["edited_by"] == "gemini" for line in lines)
+             warnings = list(record["audio"]["warnings"])
+             if flagged:
+                 warnings.append(f"{flagged} line{'s need' if flagged != 1 else ' needs'} manual review: "
+                                 "even the speed limits do not fit them to their slot.")
++            if skipped:
++                warnings.append(f"{skipped} short line{'s' if skipped != 1 else ''} (one or two words) "
++                                f"{'were' if skipped != 1 else 'was'} not rewritten (SKIPPED_REWRITE) and "
++                                f"{'play' if skipped != 1 else 'plays'} at 1.0x: edit the words here if needed.")
+             if rewritten:
+                 warnings.append(f"{rewritten} line{'s were' if rewritten != 1 else ' was'} rewritten by Gemini "
+                                 "in AD Tool V2 to fit its slot; the script's wording is shown beside each.")
+diff --git a/quality_check/dubbing.py b/quality_check/dubbing.py
+index 613cec6..f07e196 100644
+--- a/quality_check/dubbing.py
++++ b/quality_check/dubbing.py
+@@ -4,8 +4,9 @@ line as its own clip.
+ Generating follows V2's pipeline (``v2/pipeline.py``) without its Gemini step: ElevenLabs per row
+ (pass 1), pass 2 (FFmpeg, between ``MIN_SPEED`` and ``MAX_SPEED``, nothing for lines within 2% of
+ their slot), ``place_dialogue`` for collisions, ``build_track`` per character. A line V2 would send
+-to Gemini (needing more than the limits) stays at 1.0x and is marked MANUAL_REVIEW: the reviewer
+-rewrites it here. Importing takes each row's pass 1.5 take from an AD version 2 ZIP and the speed
++to Gemini (needing more than the limits) stays at 1.0x and is marked MANUAL_REVIEW (SKIPPED_REWRITE
++for a line of one or two words, which V2 never rewrites): the reviewer rewrites it here. Importing
++takes each row's take from an AD version 2 ZIP (pass 1, or pass 2 for a rewritten row) and the speed
+ V2 gave it, then goes straight to placing and building. Differences from V2, all needed by the review:
+ 
+ * Generating is resumable: a clip already on disk is reused, so retrying after an ElevenLabs error
+@@ -32,6 +33,8 @@ import wave
+ from v2.audio_builder import build_track, read_clip
+ from v2.audio_speed import change_speed, check_ffmpeg, measure, pass2_speed, trim_leading_silence
+ from v2.exporter import format_tcr
++from v2.pipeline import SKIP_REWRITE_MAX_WORDS, SKIPPED_NOTE
++from v2.rewrite import word_count
+ from v2.timing import place_dialogue
+ 
+ PEAKS_PER_SECOND = 100  # 10 ms waveform resolution for the lane view
+@@ -97,7 +100,9 @@ def describe_take(wav, row):
+     measured = measure(wav, row.end_ms - row.start_ms)
+     info = {"fit_speed": pass2_speed(measured, manual_review=measured.needs_rewrite),
+             "needed_speed": measured.desired_speed}
+-    if measured.needs_rewrite:
++    if measured.needs_rewrite and word_count(row.text) <= SKIP_REWRITE_MAX_WORDS:
++        info.update(status="SKIPPED_REWRITE", note=SKIPPED_NOTE)
++    elif measured.needs_rewrite:
+         info.update(status="MANUAL_REVIEW", note="needs a speed outside the limits: rewrite the line")
+     return info
+ 
+diff --git a/quality_check/exporting.py b/quality_check/exporting.py
+index a754e6c..f122766 100644
+--- a/quality_check/exporting.py
++++ b/quality_check/exporting.py
+@@ -108,7 +108,8 @@ def build_export(folder, record, rows, out_path):
+             measured_take = {f"pass1_5_{k}": v for k, v in fields(line).items()}
+             pass1 = info.get("pass1") or fields(line)   # generated here: the take is the first take
+             reviewed = key in speeds
+-            status = ("MANUAL_REVIEW" if info.get("status") == "MANUAL_REVIEW" and not reviewed
++            kept = info.get("status") if info.get("status") in ("MANUAL_REVIEW", "SKIPPED_REWRITE") else None
++            status = (kept if kept and not reviewed
+                       else "OK" if played.within_target else "TCR_OUT_OVERRUN")
+             original = edits[key]["original"] if key in edits else row.text
+             records.append(dict(excel_row=row.row_number, episode=row.episode, character=row.character,
+diff --git a/quality_check/importing.py b/quality_check/importing.py
+index 8ac69ef..7300d86 100644
+--- a/quality_check/importing.py
++++ b/quality_check/importing.py
+@@ -1,15 +1,18 @@
+ """Read an AD version 2 output ZIP so one of its episodes can be reviewed without dubbing it again.
+ 
+-Only two things in the ZIP are used:
++Only these are used from the ZIP:
+ 
+   processing_report.csv   one record per row: its timing in ms, frame rate, character, voice, the
+                           script's dialogue and the dialogue spoken (a Gemini rewrite or the same),
+                           and the pass 2 speed
+-  pass1_5/lines/          each row's take before the speed change
++  pass1/lines/            the take of every row that was not rewritten (ElevenLabs, trimmed)
++  pass2/lines/            the take of every row Gemini rewrote (the rewritten take before its speed
++                          change is not in the ZIP, so the delivered clip becomes the take, at 1.0x)
+ 
+ Everything needed to place a line is in the report, so the workbook is not read: no worksheet or
+-frame-rate settings are needed. The take is kept as the line's take, and the clip that plays is the
+-take at the report's pass 2 speed (the same FFmpeg call V2 made, so it matches V2's pass 2 audio).
++frame-rate settings are needed. The clip that plays is the take at its speed: for a row that was
++not rewritten, the report's pass 2 speed (the same FFmpeg call V2 made, so it matches V2's pass 2
++audio); for a rewritten row, 1.0x, which is V2's pass 2 clip itself.
+ The session rebuilds the tracks from these clips with V2's rule. The ZIP's script.xlsx is copied
+ only so the export can write reviewed lines back into it.
+ """
+@@ -20,14 +23,16 @@ from pathlib import Path
+ import zipfile
+ 
+ from v2.audio_builder import read_clip
+-from v2.exporter import LINES_DIR, PASS1_5_DIR, SCRIPT_NAME, line_name
++from v2.audio_speed import sig
++from v2.exporter import LINES_DIR, PASS1_DIR, PASS2_DIR, SCRIPT_NAME, line_name
+ from v2.models import DialogueRow
+ 
+ REPORT_NAME = "processing_report.csv"
+ REQUIRED_FIELDS = ("excel_row", "episode", "character", "voice_id", "fps", "start_ms", "end_ms",
+                    "original_dialogue", "final_dialogue", "rewritten", "rewrite_attempts", "leading_trim_ms",
+                    "pass1_audio_duration_ms", "pass1_overrun_ms", "pass1_percent_overrun", "pass1_desired_speed",
+-                   "pass1_5_desired_speed", "pass2_speed", "status", "note")
++                   "pass1_5_desired_speed", "pass2_speed", "pass2_audio_duration_ms", "tcr_duration_ms",
++                   "status", "note")
+ REMAKE = "Run the script through AD Tool V2 again and use the new ZIP."
+ 
+ 
+@@ -46,8 +51,10 @@ class V2Run:
+             raise RunError("This file is not a ZIP. Upload the ZIP that AD Tool V2 delivered.") from None
+         try:
+             names = set(self.archive.namelist())
+-            if REPORT_NAME not in names or not any(n.startswith(f"{PASS1_5_DIR}/{LINES_DIR}/") for n in names):
+-                raise RunError(f"This ZIP has no pass1_5 line clips, so it was made by an earlier AD Tool V2. {REMAKE}")
++            if REPORT_NAME not in names or not all(any(n.startswith(f"{folder}/{LINES_DIR}/") for n in names)
++                                                   for folder in (PASS1_DIR, PASS2_DIR)):
++                raise RunError(f"This ZIP has no pass1 and pass2 line clips, so it was made by an earlier "
++                               f"AD Tool V2. {REMAKE}")
+             self.records = self._read_report()
+             self.fps = self.records[0]["fps"]
+             self.rows = [DialogueRow(r["excel_row"], r["episode"], r["character"], r["start_ms"], r["end_ms"],
+@@ -75,7 +82,7 @@ class V2Run:
+         try:
+             for record in reader:
+                 record = {key: unquote(value) for key, value in record.items()}
+-                for key in ("excel_row", "fps", "start_ms", "end_ms"):
++                for key in ("excel_row", "fps", "start_ms", "end_ms", "pass2_audio_duration_ms", "tcr_duration_ms"):
+                     record[key] = int(record[key])
+                 for key in ("pass1_5_desired_speed", "pass2_speed"):
+                     record[key] = float(record[key])
+@@ -105,8 +112,12 @@ class V2Run:
+         takes = {}
+         for row in rows:
+             r = self.by_row[row.row_number]
++            if rewritten(r):   # the take is V2's pass 2 clip: it plays at 1.0x
++                fit, needed = 1.0, sig(r["pass2_audio_duration_ms"] / r["tcr_duration_ms"])
++            else:
++                fit, needed = r["pass2_speed"], r["pass1_5_desired_speed"]
+             takes[row.row_number] = {
+-                "fit_speed": r["pass2_speed"], "needed_speed": r["pass1_5_desired_speed"],
++                "fit_speed": fit, "needed_speed": needed,
+                 "status": r["status"], "note": r["note"], "rewrite_attempts": r["rewrite_attempts"],
+                 "leading_trim_ms": r["leading_trim_ms"],
+                 "pass1": {key: r[f"pass1_{key}"] for key in
+@@ -124,11 +135,13 @@ class V2Run:
+         return edits
+ 
+     def clips(self, rows):
+-        """Each row's take bytes, checked; every row with a missing or unreadable clip is reported at once."""
++        """Each row's take bytes (pass 1, or pass 2 for a rewritten row), checked; every row with a
++        missing or unreadable clip is reported at once."""
+         clips, missing = {}, []
+         for row in rows:
++            folder = PASS2_DIR if rewritten(self.by_row[row.row_number]) else PASS1_DIR
+             try:
+-                data = self.archive.read(f"{PASS1_5_DIR}/{LINES_DIR}/{line_name(row)}")
++                data = self.archive.read(f"{folder}/{LINES_DIR}/{line_name(row)}")
+                 read_clip(data)
+                 clips[row.row_number] = data
+             except Exception:  # not in the ZIP, or not a WAV
+@@ -144,6 +157,11 @@ class V2Run:
+             Path(target).write_bytes(self.script)
+ 
+ 
++def rewritten(record):
++    """Pass 1.5 kept a new take (even if Gemini's words happened to match the script's)."""
++    return record["rewritten"] == "yes"
++
++
+ def unquote(value):
+     """Undo the report's spreadsheet-formula guard (a leading ' before =, +, - or @)."""
+     if isinstance(value, str) and value.startswith("'") and value[1:2] in ("=", "+", "-", "@"):
+diff --git a/quality_check/tests/test_upload.py b/quality_check/tests/test_upload.py
+index f1c3d94..1556d13 100644
+--- a/quality_check/tests/test_upload.py
++++ b/quality_check/tests/test_upload.py
+@@ -205,11 +205,13 @@ class DubbingTests(unittest.TestCase):
+         folder = self.runtime / sid
+         lines = {line["row"]: line for line in record["audio"]["lines"]}
+         # Row 6 needs 0.81x: within the limits, so pass 2 slows it. Rows 2-5 need more than the
+-        # limits allow: they stay at 1.0x and are marked for the reviewer to rewrite.
++        # limits allow: they stay at 1.0x and are marked for the reviewer to rewrite, or, for
++        # "Stop!" (one word), marked as a short line that is not rewritten.
+         self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
+                          {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 0.81})
+         self.assertEqual({row: line["status"] for row, line in lines.items()},
+-                         {2: "MANUAL_REVIEW", 3: "MANUAL_REVIEW", 4: "MANUAL_REVIEW", 5: "MANUAL_REVIEW", 6: ""})
++                         {2: "MANUAL_REVIEW", 3: "MANUAL_REVIEW", 4: "MANUAL_REVIEW", 5: "SKIPPED_REWRITE", 6: ""})
++        self.assertEqual(lines[5]["note"], "skipped AI rewriting due to length")
+         self.assertEqual(lines[4]["needed_speed"], 2.16)                    # unlimited, 8 significant figures
+         self.assertTrue(any("manual review" in w for w in record["audio"]["warnings"]))
+         for row, line in lines.items():
+@@ -257,8 +259,9 @@ class DubbingTests(unittest.TestCase):
+         self.assertEqual(body["changed_tracks"], [1])                 # AMRITA only
+         self.assertEqual(self.track_bytes(sid, 0), kuhu_before)       # KUHU's file untouched
+         new = {l["row"]: l for l in body["audio"]["lines"]}
+-        # The new take gets the same rule: far too short even at 0.8x, so 1.0x and marked for review.
+-        self.assertEqual((new[3]["fit_speed"], new[3]["status"]), (1.0, "MANUAL_REVIEW"))
++        # The new take gets the same rule: far too short even at 0.8x, and only one word, so 1.0x and
++        # marked as a short line that is not rewritten.
++        self.assertEqual((new[3]["fit_speed"], new[3]["status"]), (1.0, "SKIPPED_REWRITE"))
+         self.assertAlmostEqual(new[3]["audio_end_ms"] - new[3]["audio_start_ms"], natural_ms("Out!"), delta=30)
+         self.assertTrue(new[3]["edited"])
+         self.assertEqual(new[3]["original"], lines[3]["text"])
+@@ -528,26 +531,30 @@ class ImportTests(unittest.TestCase):
+                     expected = wav.readframes(wav.getnframes())
+                 with wave.open(str(folder / "tracks" / f"{track['index']}.wav")) as wav:
+                     self.assertEqual(wav.readframes(wav.getnframes()), expected, track["character"])
+-            # The take is V2's pass 1.5 clip; what plays is that take at the report's speed, which
+-            # is exactly V2's pass 2 clip (row 6 was slowed to 0.81x).
+-            for row, name in ((4, "ep1_kuhu_row4.wav"), (6, "ep1_amrita_row6.wav")):
+-                self.assertEqual((folder / "clips" / f"{row}.take.wav").read_bytes(), archive.read(f"pass1_5/lines/{name}"))
+-                self.assertEqual((folder / "clips" / f"{row}.wav").read_bytes(), archive.read(f"pass2/lines/{name}"))
++            # A row that was not rewritten takes its pass 1 clip and plays it at the report's speed,
++            # which is exactly V2's pass 2 clip (row 6 was slowed to 0.81x). A rewritten row (row 4)
++            # takes V2's pass 2 clip and plays it as it is. pass1_5/ is not in the ZIP.
++            self.assertFalse([n for n in archive.namelist() if n.startswith("pass1_5/")])
++            name4, name6 = "ep1_kuhu_row4.wav", "ep1_amrita_row6.wav"
++            self.assertEqual((folder / "clips" / "6.take.wav").read_bytes(), archive.read(f"pass1/lines/{name6}"))
++            self.assertEqual((folder / "clips" / "6.wav").read_bytes(), archive.read(f"pass2/lines/{name6}"))
++            self.assertEqual((folder / "clips" / "4.take.wav").read_bytes(), archive.read(f"pass2/lines/{name4}"))
++            self.assertEqual((folder / "clips" / "4.wav").read_bytes(), archive.read(f"pass2/lines/{name4}"))
+         lines = {line["row"]: line for line in record["audio"]["lines"]}
+         self.assertEqual({row: line["fit_speed"] for row, line in lines.items()},
+                          {2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 0.81})     # from V2's report
+         self.assertEqual(lines[4]["needed_speed"], 0.99)                 # the rewrite's own speed
+-        # Gemini's rewrites play and show as edits beside the script's wording; row 5's rewrite
+-        # still does not fit, so it is marked for manual review.
++        # Gemini's rewrites play and show as edits beside the script's wording. Row 5 ("Stop!") is one
++        # word, so AD Tool V2 did not rewrite it.
+         self.assertEqual((lines[4]["edited"], lines[4]["edited_by"], lines[4]["original"]),
+                          (True, "gemini", ONE_EPISODE[2][6]))
+         self.assertTrue(lines[4]["text"].startswith("[Gasps] "))
+         self.assertEqual((lines[6]["edited"], lines[6]["text"]), (False, ONE_EPISODE[4][6]))
+-        self.assertEqual(lines[5]["status"], "MANUAL_REVIEW")
+-        self.assertIn("kept at 1.0x", lines[5]["note"])
++        self.assertEqual((lines[5]["status"], lines[5]["note"], lines[5]["edited"]),
++                         ("SKIPPED_REWRITE", "skipped AI rewriting due to length", False))
+         warnings = " ".join(record["audio"]["warnings"])
+         self.assertIn("rewritten by Gemini", warnings)
+-        self.assertIn("manual review", warnings)
++        self.assertIn("not rewritten (SKIPPED_REWRITE)", warnings)
+ 
+     def test_imported_line_speed_is_measured_from_the_natural_take(self):
+         record = self.wait(self.start(self.server_run()).get_json()["session_id"])
+@@ -606,7 +613,7 @@ class ImportTests(unittest.TestCase):
+         self.assertIn("earlier AD Tool V2", response.get_json()["error"])
+         old = io.BytesIO()
+         with zipfile.ZipFile(old, "w") as archive:          # line clips, but a report from before pass 1.5
+-            archive.writestr("pass1_5/lines/ep1_kuhu_row2.wav", b"RIFF")
++            archive.writestr("pass1_5/lines/ep1_kuhu_row2.wav", b"RIFF")    # the layout before pass1/ came back
+             archive.writestr("processing_report.csv", "excel_row,episode,duration,fit_speed\n2,1,1000,1.00\n")
+         response = upload(old.getvalue())
+         self.assertEqual(response.status_code, 400)
+@@ -620,7 +627,7 @@ class ImportTests(unittest.TestCase):
+         # A clip missing from the ZIP is reported by row before anything is stored.
+         path = self.v2_runtime / run_id / "AD_v2_output.zip"
+         with zipfile.ZipFile(path) as archive:
+-            items = {name: archive.read(name) for name in archive.namelist() if name != "pass1_5/lines/ep1_amrita_row3.wav"}
++            items = {name: archive.read(name) for name in archive.namelist() if name != "pass2/lines/ep1_amrita_row3.wav"}
+         with zipfile.ZipFile(path, "w") as archive:
+             for name, data in items.items():
+                 archive.writestr(name, data)
+diff --git a/v2/README.md b/v2/README.md
+index 4e4ffe1..48af50f 100644
+--- a/v2/README.md
++++ b/v2/README.md
+@@ -25,8 +25,8 @@ Open http://127.0.0.1:5071. The original application can continue on port 5070.
+ **Three passes fit every line to its slot** (TCR OUT − TCR IN). Limits are set once in `v2/audio_speed.py` (`MIN_SPEED`, `MAX_SPEED`, `NORMAL_TOLERANCE_PERCENT`, `SUCCESS_TARGET_PERCENT`).
+ 
+ - **Pass 1:** ElevenLabs generates every row, the leading silence is trimmed, and the take is measured. Its *audio duration* (the meter) runs from the first sound to the end of speech; trailing silence is not counted. `overrun_ms` = audio − slot (negative when the line is too short), `percent_overrun` = overrun ÷ slot × 100, `desired_speed` = audio ÷ slot with no limits. Speeds and percentages keep 8 significant figures. A row within ±2% is *normal* and is never changed. Pass 1 audio is not in the download.
+-- **Pass 1.5:** a row whose desired speed is above 1.2x or below 0.8x is rewritten by Gemini (`v2/rewrite.py`, model `MODEL_ID`) to last its slot at 1.0x, keeping its meaning, tone and character (the character's other lines in the episode are sent for context; `[tags]` are kept exactly), then generated again with ElevenLabs. Up to 2 attempts; the second is told how the first came out. The attempt closest to 1.0x is kept, stopping early once one is within 2%. If the best rewrite is still outside 0.8x–1.2x, or Gemini fails, or the line is tag-only, the row is kept at 1.0x and flagged `MANUAL_REVIEW`. More than 10% of rows flagged prints a warning: that points to a problem earlier in the pipeline. Set `GEMINI_API_KEY` in `v2/.env`.
+-- **Pass 2:** FFmpeg's `atempo` applies the desired speed, held between 0.8x and 1.2x, keeping the voice's pitch, to every row that is neither normal nor flagged. Each line is then measured again. The run prints its success rate: the share of rows at most 2% over their slot (shorter lines count as within target), against a target of 90%.
++- **Pass 1.5:** a row whose desired speed is above 1.2x or below 0.8x is rewritten by Gemini (`v2/rewrite.py`, model `MODEL_ID`) to last its slot at 1.0x, keeping its meaning, tone and character (the character's other lines in the episode are sent for context; `[tags]` are kept exactly), then generated again with ElevenLabs. Up to 2 attempts; the second is told how the first came out. The attempt closest to 1.0x is kept, stopping early once one is within 2%. If the best rewrite is still outside 0.8x–1.2x, or Gemini fails, the row is kept at 1.0x and flagged `MANUAL_REVIEW`. A line of one or two words (not counting `[tags]`; tag-only lines count as zero) is never rewritten, because rewriting a word or two loses its meaning in context: it keeps its pass 1 take at 1.0x and is marked `SKIPPED_REWRITE` with the note "skipped AI rewriting due to length". Words are counted by spaces, so languages written without spaces count a whole phrase as one word. More than 10% of rows flagged prints a warning: that points to a problem earlier in the pipeline. Set `GEMINI_API_KEY` in `v2/.env`.
++- **Pass 2:** FFmpeg's `atempo` applies the desired speed, held between 0.8x and 1.2x, keeping the voice's pitch, to every row that is not normal, flagged or skipped. Each line is then measured again. The run prints its success rate: the share of rows at most 2% over their slot (shorter lines count as within target), against a target of 90%.
+ 
+ FFmpeg must be on PATH; a missing FFmpeg or Gemini key is reported before any speech is generated.
+ 
+@@ -57,7 +57,7 @@ The ZIP contains:
+ 
+ | Path | Contents |
+ | --- | --- |
+-| `pass1_5/lines/ep<episode>_<character>_row<excel row>.wav` | Each dubbed row before the speed change, leading silence trimmed; rewritten rows use the rewritten take |
++| `pass1/lines/ep<episode>_<character>_row<excel row>.wav` | Each dubbed row as ElevenLabs first voiced it, leading silence trimmed; never rewritten or sped up |
+ | `pass2/lines/ep<episode>_<character>_row<excel row>.wav` | The same rows after pass 2 (the audio delivered) |
+ | `pass2/tracks/ep<episode>_<character>.wav` | One full-length timeline per episode and character, built from the pass 2 lines |
+ | `ep<episode>_timeline.csv` | All characters of an episode in adjusted chronological order, with the dialogue actually spoken |
+@@ -80,8 +80,8 @@ excel_row,episode,character,voice_id,start_TCR,end_TCR,fps,start_ms,end_ms,tcr_d
+ 
+ - `start_TCR`/`end_TCR` are the script times as `HH:MM:SS:FF` at the run's frame rate (`fps`); `start_ms`/`end_ms` the same in milliseconds; `tcr_duration_ms` is the slot.
+ - `final_dialogue` is what is spoken in the delivered audio (the Gemini rewrite when `rewritten` is `yes`). `rewrite_attempts` counts Gemini requests.
+-- `pass1_*` describe the first ElevenLabs take, `pass1_5_*` the take kept after pass 1.5, `pass2_*` the delivered audio. `pass2_speed` is the FFmpeg speed applied (`1.0000000` for normal and flagged rows).
+-- `status` is `OK`, `TCR_OUT_OVERRUN` (pass 2 audio more than 2% over its slot) or `MANUAL_REVIEW`; `note` says why a row was flagged.
++- `pass1_*` describe the first ElevenLabs take (`pass1/lines/`), `pass1_5_*` the take kept after pass 1.5 (measurements only; that audio is not in the ZIP), `pass2_*` the delivered audio. `pass2_speed` is the FFmpeg speed applied (`1.0000000` for normal, flagged and skipped rows).
++- `status` is `OK`, `TCR_OUT_OVERRUN` (pass 2 audio more than 2% over its slot), `MANUAL_REVIEW` or `SKIPPED_REWRITE` (one or two words, not rewritten); `note` says why.
+ - `adjusted_start_TCR` and `adjusted_end_TCR` show the actual placement and the end of the pass 2 clip. TCR display rounds to the nearest frame (half-frame ties round up); audio placement stays in milliseconds.
+ 
+ Validation runs before speech generation. Requests are sequential and are not automatically retried: retrying after a provider failure can incur additional charges for already generated rows. A failed run produces no completed ZIP and discards temporary audio. API voice availability is checked by ElevenLabs during generation. No live API calls are needed for tests: ElevenLabs and Gemini are replaced by fakes.
+diff --git a/v2/app.py b/v2/app.py
+index b7ebb93..ffd1bf3 100644
+--- a/v2/app.py
++++ b/v2/app.py
+@@ -202,7 +202,7 @@ def create_app(config=None):
+                                        progress=jobs[job_id]["progress"].append,
+                                        progress_state=lambda state: jobs[job_id].update(state))
+                 jobs[job_id].update({key: summary[key] for key in (
+-                                        "flagged_rows", "fitted_rows", "rewritten_rows", "manual_review_rows",
++                                        "flagged_rows", "fitted_rows", "rewritten_rows", "manual_review_rows", "skipped_rows",
+                                         "overrun_rows", "success_percent", "success")})
+                 jobs[job_id].update(status="done", percent=100, phase="Complete")
+                 write_run_record(job_dir, dict(record, status="done", finished=time.time(),
+diff --git a/v2/exporter.py b/v2/exporter.py
+index bae1f01..358e0fe 100644
+--- a/v2/exporter.py
++++ b/v2/exporter.py
+@@ -10,9 +10,8 @@ def safe_component(value):
+ 
+ 
+ # ZIP layout. Quality Check reads these names when it imports a run, so keep both tools in step.
+-PASS1_DIR = "pass1"            # older runs only: no longer in the ZIP (Quality Check still reads it until updated)
+-PASS1_5_DIR = "pass1_5"        # each trimmed take; rows rewritten by Gemini use the rewritten take
+-PASS2_DIR = "pass2"            # each line fitted to its slot with FFmpeg (what is delivered)
++PASS1_DIR = "pass1"            # the ElevenLabs dub as delivered, leading silence trimmed (never rewritten or sped up)
++PASS2_DIR = "pass2"            # the delivered audio: rewritten where needed, then fitted to its slot with FFmpeg
+ TRACKS_DIR = "tracks"          # in each pass: one full-length timeline WAV per <character, episode>
+ LINES_DIR = "lines"            # in each pass: one WAV per dubbed row
+ SCRIPT_NAME = "script.xlsx"    # copy of the input workbook
+diff --git a/v2/pipeline.py b/v2/pipeline.py
+index a62924b..86d3b17 100644
+--- a/v2/pipeline.py
++++ b/v2/pipeline.py
+@@ -1,19 +1,22 @@
+ """Parse -> pass 1 -> pass 1.5 -> pass 2 -> place -> tracks -> ZIP.
+ 
+   pass 1     ElevenLabs generates every row; its leading silence is trimmed and the take is measured
+-             against its slot (``audio_speed.measure``). Not part of the download.
++             against its slot (``audio_speed.measure``).
+   pass 1.5   rows whose desired speed is outside MIN_SPEED..MAX_SPEED are rewritten by Gemini and
+              regenerated by ElevenLabs, up to MAX_REWRITE_ATTEMPTS times. Each attempt is told how
+              the earlier ones came out; the attempt whose speed is closest to 1.0x is kept, and the
+              loop stops early once a take is within the normal 2%. If no rewrite reaches the limits,
+-             the best rewrite is kept at 1.0x and the row is flagged MANUAL_REVIEW. Every other row
+-             keeps its pass 1 take.
++             the best rewrite is kept at 1.0x and the row is flagged MANUAL_REVIEW.
++             Lines of SKIP_REWRITE_MAX_WORDS words or fewer (not counting [tags]) are never rewritten:
++             rewriting a word or two loses its meaning in context. They keep their pass 1 take at 1.0x
++             and are marked SKIPPED_REWRITE. Every other row keeps its pass 1 take.
++             The rewritten takes are only an intermediate step; they are not in the download.
+   pass 2     FFmpeg applies the desired speed (held within the limits) to every row that is not
+-             normal and not flagged, then each line is measured again.
++             normal, flagged or skipped, then each line is measured again.
+ 
+ ZIP layout (names are lowercase, spaces as "_"):
+-  pass1_5/lines/ep<ep>_<character>_row<row>.wav   trimmed take per row; rewritten rows use the rewrite
+-  pass2/lines/ep<ep>_<character>_row<row>.wav     the same lines after pass 2 (the audio delivered)
++  pass1/lines/ep<ep>_<character>_row<row>.wav     the ElevenLabs dub, leading silence trimmed
++  pass2/lines/ep<ep>_<character>_row<row>.wav     each line after pass 1.5 and pass 2 (the audio delivered)
+   pass2/tracks/ep<ep>_<character>.wav             one timeline per <character, episode>, from pass 2
+   ep<ep>_timeline.csv                             combined timeline per episode (pass 2, final dialogue)
+   processing_report.csv                           one record per row, every pass side by side
+@@ -30,13 +33,16 @@ from .audio_builder import build_track, read_clip
+ from .audio_speed import (MAX_SPEED, MIN_SPEED, NORMAL_TOLERANCE_PERCENT, SUCCESS_TARGET_PERCENT, Measurement,
+                           apply_pass2, check_ffmpeg, format_sig, measure, sig, success_rate, trim_leading_silence)
+ from .excel_parser import parse_excel
+-from .exporter import (LINES_DIR, PASS1_5_DIR, PASS2_DIR, SCRIPT_NAME, TRACKS_DIR, StreamingArchive, format_tcr,
++from .exporter import (LINES_DIR, PASS1_DIR, PASS2_DIR, SCRIPT_NAME, TRACKS_DIR, StreamingArchive, format_tcr,
+                        line_name, track_names, timeline_names, write_report, write_timeline)
+-from .rewrite import Attempt, GeminiRewriter, RewriteError, RewriteRequest, has_spoken_words
++from .rewrite import Attempt, GeminiRewriter, RewriteError, RewriteRequest, word_count
+ from .timing import place_dialogue
+ from .tts_client import ElevenLabsClient
+ 
+ MAX_REWRITE_ATTEMPTS = 2
++SKIP_REWRITE_MAX_WORDS = 2           # lines this short are never sent to Gemini
++SKIPPED_NOTE = "skipped AI rewriting due to length"
++KEPT_DIR = "kept"                    # work folder, not in the ZIP: the take pass 2 starts from
+ MANUAL_REVIEW_WARNING_PERCENT = 10   # more flagged rows than this points to a problem earlier in the pipeline
+ 
+ 
+@@ -51,6 +57,7 @@ class Line:
+     rewrite_calls: int = 0
+     rewritten: bool = False
+     manual_review: bool = False
++    skipped: bool = False          # too short to rewrite: kept at 1.0x, SKIPPED_REWRITE
+     note: str = ""
+     pass2_speed: float = 1.0
+     pass2: Measurement = None
+@@ -95,7 +102,8 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
+     progress(f"Validated {len(rows)} dialogue rows; {len(names)} tracks; {fps} fps")
+     with tempfile.TemporaryDirectory(prefix="ad-v2-", dir=output_path.parent) as workspace:
+         workspace = Path(workspace)
+-        for folder in (f"{PASS1_5_DIR}/{LINES_DIR}", f"{PASS2_DIR}/{LINES_DIR}", f"{PASS2_DIR}/{TRACKS_DIR}"):
++        for folder in (f"{PASS1_DIR}/{LINES_DIR}", f"{KEPT_DIR}/{LINES_DIR}", f"{PASS2_DIR}/{LINES_DIR}",
++                       f"{PASS2_DIR}/{TRACKS_DIR}"):
+             (workspace / folder).mkdir(parents=True)
+ 
+         def save(folder, row, wav):
+@@ -111,7 +119,8 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
+             take, trimmed = generate(row, row.text)
+             line = Line(row, trimmed, measure(take, row.end_ms - row.start_ms), text=row.text)
+             line.pass1_5 = line.pass1
+-            save(PASS1_5_DIR, row, take)
++            save(PASS1_DIR, row, take)
++            save(KEPT_DIR, row, take)
+             lines[row.row_number] = line
+             progress(f"Excel row {row.row_number}: trimmed {trimmed} ms; {describe(line.pass1)}")
+             update_state(round(index / len(rows) * 60), "Pass 1: generating audio")
+@@ -129,9 +138,9 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
+         clip_paths = {}
+         for line in lines.values():
+             row = line.row
+-            take = (workspace / PASS1_5_DIR / LINES_DIR / line_name(row)).read_bytes()
++            take = (workspace / KEPT_DIR / LINES_DIR / line_name(row)).read_bytes()
+             try:
+-                fitted, line.pass2_speed = (apply_pass2(take, line.pass1_5, line.manual_review)
++                fitted, line.pass2_speed = (apply_pass2(take, line.pass1_5, line.manual_review or line.skipped)
+                                             if fit_lines else (take, 1.0))
+                 line.clip_ms = len(read_clip(fitted))
+             except Exception as exc:
+@@ -149,7 +158,7 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
+         # Disk use is kept low by streaming into the ZIP: each full-length track goes into the ZIP
+         # the moment it is built and its WAV is deleted, so only one track is ever on disk.
+         with StreamingArchive(output_path) as archive:
+-            for folder in (PASS1_5_DIR, PASS2_DIR):
++            for folder in (PASS1_DIR, PASS2_DIR):
+                 for path in sorted((workspace / folder / LINES_DIR).iterdir()):
+                     archive.add(path, path.relative_to(workspace).as_posix())
+ 
+@@ -188,9 +197,9 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
+ def rewrite_line(line, rows, rewrite, generate, save, progress):
+     """Pass 1.5 for one row: keep the rewrite closest to 1.0x, or flag the row for manual review."""
+     row = line.row
+-    if not has_spoken_words(row.text):
+-        line.manual_review, line.note = True, "tag-only line: nothing to rewrite"
+-        progress(f"Pass 1.5: Excel row {row.row_number} is tag-only; flagged for manual review")
++    if word_count(row.text) <= SKIP_REWRITE_MAX_WORDS:
++        line.skipped, line.note = True, SKIPPED_NOTE
++        progress(f"Pass 1.5: Excel row {row.row_number} has {word_count(row.text)} word(s): {SKIPPED_NOTE}; kept at 1.0x")
+         return
+     context = tuple(other.text for other in rows
+                     if other.group == row.group and other.row_number != row.row_number)
+@@ -217,7 +226,7 @@ def rewrite_line(line, rows, rewrite, generate, save, progress):
+         return
+     line.text, take, line.trim_ms, line.pass1_5 = best
+     line.rewritten = True
+-    save(PASS1_5_DIR, row, take)
++    save(KEPT_DIR, row, take)
+     if line.pass1_5.needs_rewrite:
+         line.manual_review = True
+         notes.append(f"best rewrite still needs {format_sig(line.pass1_5.desired_speed)}x: kept at 1.0x")
+@@ -239,6 +248,8 @@ def measurement_fields(prefix, measurement):
+ 
+ 
+ def status(line):
++    if line.skipped:
++        return "SKIPPED_REWRITE"
+     if line.manual_review:
+         return "MANUAL_REVIEW"
+     return "OK" if line.pass2.within_target else "TCR_OUT_OVERRUN"
+@@ -268,12 +279,14 @@ def summarize(output_path, lines, names, progress):
+     total = len(lines)
+     rewritten = sum(line.rewritten for line in lines)
+     manual = sum(line.manual_review for line in lines)
++    skipped = sum(line.skipped for line in lines)
+     fitted = sum(line.pass2_speed != 1.0 for line in lines)
+     overrun = sum(status(line) == "TCR_OUT_OVERRUN" for line in lines)
+     success_percent, success = success_rate(line.pass2 for line in lines)
+     manual_percent = sig(manual / total * 100)
+     progress(f"Complete: {len(names)} tracks; {rewritten} rows rewritten in pass 1.5; {fitted} rows sped up or "
+-             f"slowed down in pass 2; {manual} rows ({format_sig(manual_percent)}%) flagged for manual review")
++             f"slowed down in pass 2; {manual} rows ({format_sig(manual_percent)}%) flagged for manual review; "
++             f"{skipped} short rows not rewritten (SKIPPED_REWRITE)")
+     mark = "✅" if success else "❌"   # Python 3.11 allows no backslashes inside f-string braces
+     progress(f"Success: {format_sig(success_percent)}% of rows within target "
+              f"(≤ +{NORMAL_TOLERANCE_PERCENT}% overrun; target {SUCCESS_TARGET_PERCENT}%) {mark}")
+@@ -281,5 +294,5 @@ def summarize(output_path, lines, names, progress):
+         progress(f"WARNING: more than {MANUAL_REVIEW_WARNING_PERCENT}% of rows need manual review. This should be "
+                  "rare; check the script timings and the earlier passes before using this run.")
+     return {"output": str(output_path), "rows": total, "tracks": len(names), "rewritten_rows": rewritten,
+-            "manual_review_rows": manual, "fitted_rows": fitted, "overrun_rows": overrun,
+-            "flagged_rows": manual + overrun, "success_percent": format_sig(success_percent), "success": success}
++            "manual_review_rows": manual, "skipped_rows": skipped, "fitted_rows": fitted, "overrun_rows": overrun,
++            "flagged_rows": manual + skipped + overrun, "success_percent": format_sig(success_percent), "success": success}
+diff --git a/v2/rewrite.py b/v2/rewrite.py
+index e6d7c03..eaf5991 100644
+--- a/v2/rewrite.py
++++ b/v2/rewrite.py
+@@ -69,6 +69,12 @@ def has_spoken_words(text):
+     return bool(re.search(r"\w", TAG_PATTERN.sub("", text)))
+ 
+ 
++def word_count(text):
++    """Spoken words, split on spaces, ignoring [tags] and stray punctuation: "[Angry] Get out!" has 2.
++    Languages written without spaces (Chinese, Japanese, Thai) count a whole phrase as one word."""
++    return sum(1 for word in TAG_PATTERN.sub(" ", text).split() if re.search(r"\w", word))
++
++
+ def seconds(ms):
+     return f"{ms / 1000:.2f} s"
+ 
+diff --git a/v2/static/app.js b/v2/static/app.js
+index 467e627..c62ac0c 100644
+--- a/v2/static/app.js
++++ b/v2/static/app.js
+@@ -139,7 +139,7 @@ async function pollStatus() {
+             setProgress(100);
+             byId('download-link').href = `/download/${activeJob}`;
+             byId('output-file-name').textContent = data.download_name || 'AD_v2_output.zip';
+-            byId('review-summary').textContent = `${data.success_percent}% of rows within target ${data.success ? '✅' : '❌'} · ${data.tracks} tracks · ${data.rewritten_rows} rows rewritten · ${data.fitted_rows} rows sped up or slowed down · ${data.manual_review_rows} rows for manual review · ${data.overrun_rows} rows over TCR OUT`;
++            byId('review-summary').textContent = `${data.success_percent}% of rows within target ${data.success ? '✅' : '❌'} · ${data.tracks} tracks · ${data.rewritten_rows} rows rewritten · ${data.fitted_rows} rows sped up or slowed down · ${data.manual_review_rows} rows for manual review · ${data.skipped_rows} short rows not rewritten · ${data.overrun_rows} rows over TCR OUT`;
+             downloadSection.style.display = 'block';
+             rememberJob(null);
+             activeJob = null;
+diff --git a/v2/templates/index.html b/v2/templates/index.html
+index af8d985..1009055 100644
+--- a/v2/templates/index.html
++++ b/v2/templates/index.html
+@@ -92,14 +92,16 @@
+                             (<a href="https://elevenlabs.io/voice-library" target="_blank" rel="noopener noreferrer">Voice Library</a>).
+                             Silence before the voice is cut, so speech starts on TCR IN.</li>
+                         <li><b>Rewrite:</b> if a line would need faster than 1.2x or slower than 0.8x to fit,
+-                            Gemini rewrites it with the same meaning, tone and character, and it is voiced again (up to 2 tries).</li>
++                            Gemini rewrites it with the same meaning, tone and character, and it is voiced again (up to 2 tries).
++                            Lines of one or two words are not rewritten: they stay at 1.0x, marked <b>SKIPPED_REWRITE</b>.</li>
+                         <li><b>Speed:</b> lines more than 2% off are sped up or slowed down, 0.8x–1.2x, pitch kept.
+                             Lines that still don't fit stay at 1.0x and are marked <b>MANUAL_REVIEW</b>.</li>
+                     </ol>
+                     <p class="field-label zip-label">In the ZIP</p>
+                     <ul class="voice-preview-note steps">
+                         <li><b>pass2/tracks/</b>: one WAV per episode and character, the final audio</li>
+-                        <li><b>pass2/lines/</b> and <b>pass1_5/lines/</b>: each line after and before the speed change</li>
++                        <li><b>pass2/lines/</b>: each line as delivered (rewritten and sped up where needed)</li>
++                        <li><b>pass1/lines/</b>: each line as ElevenLabs first voiced it, before any rewrite or speed change</li>
+                         <li><b>processing_report.csv</b>: per line timings, speed, rewrite and status; plus a timeline CSV per episode and the script</li>
+                     </ul>
+                     <p class="field-help">A line starts on its TCR IN, or straight after the same character's previous line if that one runs late.
+diff --git a/v2/tests/test_pipeline.py b/v2/tests/test_pipeline.py
+index 34d5b36..77b9cc1 100644
+--- a/v2/tests/test_pipeline.py
++++ b/v2/tests/test_pipeline.py
+@@ -141,7 +141,7 @@ class PipelineTests(unittest.TestCase):
+                      "lines/ep001_alice_row2.wav", "lines/ep001_bob_row3.wav", "lines/ep001_alice_row4.wav",
+                      "lines/ep002_alice_row5.wav"}
+             lines = {name for name in audio if name.startswith("lines/")}
+-            self.assertEqual(set(archive.namelist()), {f"pass1_5/{name}" for name in lines} | {f"pass2/{name}" for name in audio} | {
++            self.assertEqual(set(archive.namelist()), {f"pass1/{name}" for name in lines} | {f"pass2/{name}" for name in audio} | {
+                 "ep001_timeline.csv", "ep002_timeline.csv", "processing_report.csv", "script.xlsx"})
+             self.assertEqual(archive.read("script.xlsx"), path.read_bytes())
+             for name in ("ep001_alice.wav", "ep001_bob.wav"):
+@@ -454,16 +454,19 @@ class PipelineTests(unittest.TestCase):
+             dialogue(start="00:00:00:00", end="00:00:02:00", text="long"),               # 1.15x: pass 2 only
+             dialogue(start="00:00:03:00", end="00:00:04:00", text="short"),              # 0.90x: pass 2 only
+             dialogue(start="00:00:05:00", end="00:00:06:00", text="fits"),               # within 2%: untouched
+-            dialogue(**bob, start="00:00:00:00", end="00:00:02:00", text="way too long"),   # 1.5x: rewritten
+-            dialogue(**bob, start="00:00:03:00", end="00:00:05:00", text="too short"),      # 0.2x: rewritten
+-            dialogue(**bob, start="00:00:06:00", end="00:00:08:00", text="stubborn"),       # 2.5x: rewrites fail
+-            dialogue(**bob, start="00:00:09:00", end="00:00:11:00", text="[Gasps]"),        # tag-only
++            dialogue(**bob, start="00:00:00:00", end="00:00:02:00", text="way too long"),          # 1.5x: rewritten
++            dialogue(**bob, start="00:00:03:00", end="00:00:05:00", text="much too short here"),   # 0.2x: rewritten
++            dialogue(**bob, start="00:00:06:00", end="00:00:08:00", text="this one is stubborn"),  # 2.5x: rewrites fail
++            dialogue(**bob, start="00:00:09:00", end="00:00:11:00", text="[Gasps]"),        # no words: skipped
++            dialogue(**bob, start="00:00:12:00", end="00:00:14:00", text="[Angry] Get out!"),  # 2 words, 1.5x: skipped
++            dialogue(**bob, start="00:00:16:00", end="00:00:18:00", text="No."),             # 1 word, 0.2x: skipped
+         ])
+         speech = {"long": 2300, "short": 900, "fits": 1010, "way too long": 3000, "shorter": 2100,
+-                  "shortest": 2000, "too short": 400, "padded": 1500, "padded more": 1600, "stubborn": 5000,
+-                  "still long": 4000, "still long 2": 3000, "[Gasps]": 500}
+-        rewrites = {"way too long": ["shorter", "shortest"], "too short": ["padded", "padded more"],
+-                    "stubborn": ["still long", "still long 2"]}
++                  "shortest": 2000, "much too short here": 400, "padded": 1500, "padded more": 1600,
++                  "this one is stubborn": 5000, "still long": 4000, "still long 2": 3000, "[Gasps]": 500,
++                  "[Angry] Get out!": 3000, "No.": 400}
++        rewrites = {"way too long": ["shorter", "shortest"], "much too short here": ["padded", "padded more"],
++                    "this one is stubborn": ["still long", "still long 2"]}
+         requests = []
+ 
+         def rewrite(request):
+@@ -479,24 +482,29 @@ class PipelineTests(unittest.TestCase):
+         output = self.root / "rewritten.zip"
+         log = []
+         summary = run_pipeline(path, output, synthesize=synthesize, rewrite=rewrite, progress=log.append)
+-        self.assertEqual((summary["rewritten_rows"], summary["manual_review_rows"], summary["fitted_rows"]), (3, 2, 3))
+-        self.assertFalse(summary["success"])                         # 6 of 7 within target
+-        self.assertEqual(summary["success_percent"], "85.714286")
+-        self.assertIn("Success: 85.714286% of rows within target", "\n".join(log))
+-        self.assertIn("WARNING", "\n".join(log))                    # 2 of 7 rows for manual review
+-        # Gemini: 2 attempts per rewritten row, each told how the earlier ones came out; none for tags.
+-        self.assertEqual([r.text for r in requests], ["way too long"] * 2 + ["too short"] * 2 + ["stubborn"] * 2)
++        self.assertEqual((summary["rewritten_rows"], summary["manual_review_rows"], summary["skipped_rows"],
++                          summary["fitted_rows"]), (3, 1, 3, 3))
++        self.assertFalse(summary["success"])                         # 7 of 9 within target
++        self.assertEqual(summary["success_percent"], "77.777778")
++        self.assertIn("Success: 77.777778% of rows within target", "\n".join(log))
++        self.assertIn("3 short rows not rewritten (SKIPPED_REWRITE)", "\n".join(log))
++        self.assertIn("WARNING", "\n".join(log))                    # 1 of 9 rows (11%) for manual review
++        # Gemini: 2 attempts per rewritten row, each told how the earlier ones came out. Lines of one or
++        # two words (or only tags) are never sent, whether too long or too short.
++        self.assertEqual([r.text for r in requests],
++                         ["way too long"] * 2 + ["much too short here"] * 2 + ["this one is stubborn"] * 2)
+         first, second = requests[:2]
+         self.assertEqual((first.duration_ms, first.target_ms, first.previous_attempts), (3000, 2000, ()))
+         self.assertEqual([(a.text, a.duration_ms) for a in second.previous_attempts], [("shorter", 2100)])
+-        self.assertEqual(first.context_lines, ("too short", "stubborn", "[Gasps]"))   # Bob's other lines
+-        self.assertNotIn("[Gasps]", [r.text for r in requests])
+-        self.assertEqual(len(synthesized), 7 + 6)                    # pass 1 + one take per rewrite
++        self.assertEqual(first.context_lines,                      # Bob's other lines
++                         ("much too short here", "this one is stubborn", "[Gasps]", "[Angry] Get out!", "No."))
++        self.assertEqual(len(synthesized), 9 + 6)                    # pass 1 + one take per rewrite
+         with zipfile.ZipFile(output) as archive:
+             names = archive.namelist()
+-            self.assertFalse([n for n in names if n.startswith("pass1/")])
+-            self.assertEqual(len([n for n in names if n.startswith("pass1_5/lines/")]), 7)
+-            self.assertEqual(len([n for n in names if n.startswith("pass2/lines/")]), 7)
++            self.assertFalse([n for n in names if n.startswith("pass1_5/")])     # not in the download
++            self.assertEqual(len([n for n in names if n.startswith("pass1/lines/")]), 9)
++            self.assertEqual(len([n for n in names if n.startswith("pass2/lines/")]), 9)
++            self.assertEqual(len([n for n in names if n.startswith("pass2/tracks/")]), 2)
+             report = {int(r["excel_row"]): r for r in csv.DictReader(io.StringIO(
+                 archive.read("processing_report.csv").decode("utf-8-sig")))}
+             pick = lambda row, *keys: tuple(report[row][k] for k in keys)
+@@ -507,16 +515,17 @@ class PipelineTests(unittest.TestCase):
+                              ("-100", "-10.000000", "0.90000000"))
+             self.assertEqual(pick(4, "pass2_speed", "status"), ("1.0000000", "OK"))
+             self.assertEqual(archive.read("pass2/lines/ep001_alice_row4.wav"),
+-                             archive.read("pass1_5/lines/ep001_alice_row4.wav"))
++                             archive.read("pass1/lines/ep001_alice_row4.wav"))
+             for row, slot in ((2, 2000), (3, 1000)):
+                 spoken = speech_span(archive.read(f"pass2/lines/ep001_alice_row{row}.wav"))[1]
+                 self.assertAlmostEqual(spoken, slot, delta=40)
+                 self.assertEqual(report[row]["leading_trim_ms"], "150")
+-            # Rewritten until within 2%: attempt 2 kept, no speed change.
++            # Rewritten until within 2%: attempt 2 kept, no speed change. Pass 1 keeps the original dub.
+             self.assertEqual(pick(5, "final_dialogue", "rewritten", "rewrite_attempts", "pass1_desired_speed",
+                                   "pass1_5_desired_speed", "pass2_speed", "status"),
+                              ("shortest", "yes", "2", "1.5000000", "1.0000000", "1.0000000", "OK"))
+-            self.assertEqual(speech_span(archive.read("pass1_5/lines/ep001_bob_row5.wav"))[1], 2000)
++            self.assertEqual(speech_span(archive.read("pass2/lines/ep001_bob_row5.wav"))[1], 2000)
++            self.assertEqual(speech_span(archive.read("pass1/lines/ep001_bob_row5.wav"))[1], 3000)
+             # Rewritten to within the limits: the closer attempt is kept and pass 2 finishes the fit.
+             self.assertEqual(pick(6, "final_dialogue", "pass1_5_desired_speed", "pass2_speed", "status"),
+                              ("padded more", "0.80000000", "0.80000000", "OK"))
+@@ -524,8 +533,13 @@ class PipelineTests(unittest.TestCase):
+             self.assertEqual(pick(7, "final_dialogue", "pass1_5_desired_speed", "pass2_speed", "status"),
+                              ("still long 2", "1.5000000", "1.0000000", "MANUAL_REVIEW"))
+             self.assertIn("kept at 1.0x", report[7]["note"])
+-            self.assertEqual(pick(8, "rewrite_attempts", "pass2_speed", "status"), ("0", "1.0000000", "MANUAL_REVIEW"))
+-            self.assertIn("tag-only", report[8]["note"])
++            # One or two words (or none): not rewritten, kept at 1.0x, too long or too short alike.
++            for row, text in ((8, "[Gasps]"), (9, "[Angry] Get out!"), (10, "No.")):
++                self.assertEqual(pick(row, "final_dialogue", "rewritten", "rewrite_attempts", "pass2_speed", "status",
++                                      "note"),
++                                 (text, "no", "0", "1.0000000", "SKIPPED_REWRITE", "skipped AI rewriting due to length"))
++                self.assertEqual(archive.read(f"pass2/lines/ep001_bob_row{row}.wav"),
++                                 archive.read(f"pass1/lines/ep001_bob_row{row}.wav"))
+             timeline = archive.read("ep001_timeline.csv").decode("utf-8-sig")
+             self.assertIn("Bob: shortest", timeline)
+             self.assertNotIn("way too long", timeline)
+diff --git a/v2/tests/test_rewrite.py b/v2/tests/test_rewrite.py
+index 2b2d11f..34b50f1 100644
+--- a/v2/tests/test_rewrite.py
++++ b/v2/tests/test_rewrite.py
+@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
+ from urllib.error import HTTPError
+ 
+ from v2.rewrite import (MODEL_ID, Attempt, GeminiRewriter, RewriteError, RewriteRequest, build_prompt,
+-                        has_spoken_words, parse_rewrite, request_body)
++                        has_spoken_words, parse_rewrite, request_body, word_count)
+ 
+ 
+ def gemini_reply(dialogue=None, raw=None):
+@@ -84,6 +84,14 @@ class ParseTests(unittest.TestCase):
+             {"text": "thinking...", "thought": True}, {"text": json.dumps({"dialogue": "[angry] Out!"})}]}}]}
+         self.assertEqual(parse_rewrite(reply, REQUEST.text), "[angry] Out!")
+ 
++    def test_word_count_ignores_tags_and_punctuation(self):
++        self.assertEqual(word_count("[Angry] Get out!"), 2)
++        self.assertEqual(word_count("[Gasps]"), 0)
++        self.assertEqual(word_count("[sighs] [laughs] ..."), 0)
++        self.assertEqual(word_count("Stop! - Now."), 2)
++        self.assertEqual(word_count("ले लो"), 2)                          # Devanagari: split on spaces too
++        self.assertEqual(word_count("I told you never to come back"), 7)
++
+     def test_tag_only_lines_have_nothing_to_rewrite(self):
+         self.assertFalse(has_spoken_words("[Gasps]"))
+         self.assertFalse(has_spoken_words("[sighs] [laughs] ..."))

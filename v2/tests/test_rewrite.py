@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
 from v2.rewrite import (MODEL_ID, Attempt, GeminiRewriter, RewriteError, RewriteRequest, build_prompt,
-                        has_spoken_words, parse_rewrite, request_body)
+                        has_spoken_words, parse_rewrite, request_body, word_count)
 
 
 def gemini_reply(dialogue=None, raw=None):
@@ -83,6 +83,14 @@ class ParseTests(unittest.TestCase):
         reply = {"candidates": [{"content": {"parts": [
             {"text": "thinking...", "thought": True}, {"text": json.dumps({"dialogue": "[angry] Out!"})}]}}]}
         self.assertEqual(parse_rewrite(reply, REQUEST.text), "[angry] Out!")
+
+    def test_word_count_ignores_tags_and_punctuation(self):
+        self.assertEqual(word_count("[Angry] Get out!"), 2)
+        self.assertEqual(word_count("[Gasps]"), 0)
+        self.assertEqual(word_count("[sighs] [laughs] ..."), 0)
+        self.assertEqual(word_count("Stop! - Now."), 2)
+        self.assertEqual(word_count("ले लो"), 2)                          # Devanagari: split on spaces too
+        self.assertEqual(word_count("I told you never to come back"), 7)
 
     def test_tag_only_lines_have_nothing_to_rewrite(self):
         self.assertFalse(has_spoken_words("[Gasps]"))

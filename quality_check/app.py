@@ -149,11 +149,16 @@ def create_app(config=None):
                                   line_speed=line_speed_of(record, key),
                                   speed_set=key in (record.get("line_speeds") or {})))
             flagged = sum(line["status"] == "MANUAL_REVIEW" for line in lines)
+            skipped = sum(line["status"] == "SKIPPED_REWRITE" for line in lines)
             rewritten = sum(line["edited_by"] == "gemini" for line in lines)
             warnings = list(record["audio"]["warnings"])
             if flagged:
                 warnings.append(f"{flagged} line{'s need' if flagged != 1 else ' needs'} manual review: "
                                 "even the speed limits do not fit them to their slot.")
+            if skipped:
+                warnings.append(f"{skipped} short line{'s' if skipped != 1 else ''} (one or two words) "
+                                f"{'were' if skipped != 1 else 'was'} not rewritten (SKIPPED_REWRITE) and "
+                                f"{'play' if skipped != 1 else 'plays'} at 1.0x: edit the words here if needed.")
             if rewritten:
                 warnings.append(f"{rewritten} line{'s were' if rewritten != 1 else ' was'} rewritten by Gemini "
                                 "in AD Tool V2 to fit its slot; the script's wording is shown beside each.")

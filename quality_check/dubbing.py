@@ -4,8 +4,9 @@ line as its own clip.
 Generating follows V2's pipeline (``v2/pipeline.py``) without its Gemini step: ElevenLabs per row
 (pass 1), pass 2 (FFmpeg, between ``MIN_SPEED`` and ``MAX_SPEED``, nothing for lines within 2% of
 their slot), ``place_dialogue`` for collisions, ``build_track`` per character. A line V2 would send
-to Gemini (needing more than the limits) stays at 1.0x and is marked MANUAL_REVIEW: the reviewer
-rewrites it here. Importing takes each row's pass 1.5 take from an AD version 2 ZIP and the speed
+to Gemini (needing more than the limits) stays at 1.0x and is marked MANUAL_REVIEW (SKIPPED_REWRITE
+for a line of one or two words, which V2 never rewrites): the reviewer rewrites it here. Importing
+takes each row's take from an AD version 2 ZIP (pass 1, or pass 2 for a rewritten row) and the speed
 V2 gave it, then goes straight to placing and building. Differences from V2, all needed by the review:
 
 * Generating is resumable: a clip already on disk is reused, so retrying after an ElevenLabs error
@@ -32,6 +33,8 @@ import wave
 from v2.audio_builder import build_track, read_clip
 from v2.audio_speed import change_speed, check_ffmpeg, measure, pass2_speed, trim_leading_silence
 from v2.exporter import format_tcr
+from v2.pipeline import SKIP_REWRITE_MAX_WORDS, SKIPPED_NOTE
+from v2.rewrite import word_count
 from v2.timing import place_dialogue
 
 PEAKS_PER_SECOND = 100  # 10 ms waveform resolution for the lane view
@@ -97,7 +100,9 @@ def describe_take(wav, row):
     measured = measure(wav, row.end_ms - row.start_ms)
     info = {"fit_speed": pass2_speed(measured, manual_review=measured.needs_rewrite),
             "needed_speed": measured.desired_speed}
-    if measured.needs_rewrite:
+    if measured.needs_rewrite and word_count(row.text) <= SKIP_REWRITE_MAX_WORDS:
+        info.update(status="SKIPPED_REWRITE", note=SKIPPED_NOTE)
+    elif measured.needs_rewrite:
         info.update(status="MANUAL_REVIEW", note="needs a speed outside the limits: rewrite the line")
     return info
 
