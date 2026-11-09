@@ -38,14 +38,15 @@ SIZE_SAFETY = 1.25           # lines can run past TCR OUT, so tracks can end lat
 
 def estimate_run_bytes(rows):
     """Peak disk use of one run. Tracks are streamed into the ZIP one at a time (pipeline.py), so the
-    peak is: every line clip for both passes (uncompressed, in the work folder), one full-length track
-    being built, and the ZIP. In the ZIP, a track's silence compresses to almost nothing, so the ZIP
-    is counted as its speech only, uncompressed: both passes' lines plus the same speech in tracks."""
+    peak is: every line clip (uncompressed, in the work folder: pass 1, the pass 1.5 working copy and
+    pass 2), one full-length track being built, and the ZIP. In the ZIP, a track's silence compresses
+    to almost nothing, so the ZIP is counted as its speech only, uncompressed: both passes' lines plus
+    the same speech in both passes' tracks."""
     episode_end = {}
     for row in rows:
         episode_end[row.episode] = max(episode_end.get(row.episode, 0), row.end_ms)
     lines_ms = sum(row.end_ms - row.start_ms for row in rows)
-    work_files = 2 * lines_ms                 # pass 1 + pass 2 line clips
+    work_files = 3 * lines_ms                 # pass 1, pass 1.5 working copy and pass 2 line clips
     one_track = max(episode_end.values(), default=0)
     archive = 2 * 2 * lines_ms                # lines + their speech in tracks, both passes
     return int((work_files + one_track + archive) * BYTES_PER_MS * SIZE_SAFETY)

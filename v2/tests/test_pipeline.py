@@ -141,7 +141,7 @@ class PipelineTests(unittest.TestCase):
                      "lines/ep001_alice_row2.wav", "lines/ep001_bob_row3.wav", "lines/ep001_alice_row4.wav",
                      "lines/ep002_alice_row5.wav"}
             lines = {name for name in audio if name.startswith("lines/")}
-            self.assertEqual(set(archive.namelist()), {f"pass1/{name}" for name in lines} | {f"pass2/{name}" for name in audio} | {
+            self.assertEqual(set(archive.namelist()), {f"pass1/{name}" for name in audio} | {f"pass2/{name}" for name in audio} | {
                 "ep001_timeline.csv", "ep002_timeline.csv", "processing_report.csv", "script.xlsx"})
             self.assertEqual(archive.read("script.xlsx"), path.read_bytes())
             for name in ("ep001_alice.wav", "ep001_bob.wav"):
@@ -505,6 +505,8 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len([n for n in names if n.startswith("pass1/lines/")]), 9)
             self.assertEqual(len([n for n in names if n.startswith("pass2/lines/")]), 9)
             self.assertEqual(len([n for n in names if n.startswith("pass2/tracks/")]), 2)
+            self.assertEqual(sorted(n for n in names if n.startswith("pass1/tracks/")),
+                             ["pass1/tracks/ep001_alice.wav", "pass1/tracks/ep001_bob.wav"])
             report = {int(r["excel_row"]): r for r in csv.DictReader(io.StringIO(
                 archive.read("processing_report.csv").decode("utf-8-sig")))}
             pick = lambda row, *keys: tuple(report[row][k] for k in keys)
@@ -548,6 +550,25 @@ class PipelineTests(unittest.TestCase):
             line = AudioSegment.from_wav(io.BytesIO(archive.read("pass2/lines/ep001_alice_row3.wav")))
             offset = timecode_to_ms(report[3]["adjusted_start_TCR"]) * 24 * 2
             self.assertEqual(alice.raw_data[offset:offset + len(line.raw_data)], line.raw_data)
+
+            # Pass 1 tracks are built from exactly the clips in pass1/lines/, placed with the same rule
+            # but their own lengths: Bob's original row 5 (3.0 s + 0.2 s tail) runs past row 6's TCR IN
+            # at 3 s, so in pass 1 row 6 starts at 3.2 s; in pass 2 the rewrite ends in time.
+            def at(track, line_path, ms):
+                track = AudioSegment.from_wav(io.BytesIO(archive.read(track))).raw_data
+                clip = AudioSegment.from_wav(io.BytesIO(archive.read(line_path))).raw_data
+                return track[ms * 48:ms * 48 + len(clip)] == clip
+            self.assertTrue(at("pass1/tracks/ep001_alice.wav", "pass1/lines/ep001_alice_row3.wav", 3000))
+            self.assertTrue(at("pass1/tracks/ep001_bob.wav", "pass1/lines/ep001_bob_row5.wav", 0))
+            self.assertTrue(at("pass1/tracks/ep001_bob.wav", "pass1/lines/ep001_bob_row6.wav", 3200))
+            self.assertTrue(at("pass2/tracks/ep001_bob.wav", "pass2/lines/ep001_bob_row6.wav", 3000))
+            self.assertNotEqual(archive.read("pass1/tracks/ep001_bob.wav"), archive.read("pass2/tracks/ep001_bob.wav"))
+            # Both passes' tracks for an episode cover the same length of time.
+            for name in ("ep001_alice.wav", "ep001_bob.wav"):
+                pass1 = AudioSegment.from_wav(io.BytesIO(archive.read(f"pass1/tracks/{name}")))
+                pass2 = AudioSegment.from_wav(io.BytesIO(archive.read(f"pass2/tracks/{name}")))
+                self.assertGreaterEqual(len(pass1), 18000)
+                self.assertGreaterEqual(len(pass2), 18000)
 
     def test_failed_rewrites_keep_the_pass1_take_for_manual_review(self):
         path = self.workbook([dialogue(start="00:00:00:00", end="00:00:02:00", text="far too long")])
@@ -650,7 +671,7 @@ class PipelineTests(unittest.TestCase):
             dialogue(character="Bob", voice="b", start="00:44:59:00", end="00:45:00:00"),
         ]))
         # 2 s of lines: 2x as work files + 4x in the ZIP; plus one 45 min track being built; 48 bytes/ms, x1.25
-        self.assertEqual(estimate_run_bytes(rows), int((6 * 2000 + 2_700_000) * 48 * 1.25))
+        self.assertEqual(estimate_run_bytes(rows), int((7 * 2000 + 2_700_000) * 48 * 1.25))
 
     def test_fit_failure_discards_output(self):
         path = self.workbook([dialogue()])

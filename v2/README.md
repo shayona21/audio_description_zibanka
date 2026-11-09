@@ -58,6 +58,7 @@ The ZIP contains:
 | Path | Contents |
 | --- | --- |
 | `pass1/lines/ep<episode>_<character>_row<excel row>.wav` | Each dubbed row as ElevenLabs first voiced it, leading silence trimmed; never rewritten or sped up |
+| `pass1/tracks/ep<episode>_<character>.wav` | One full-length timeline per episode and character, built from the pass 1 lines with the same placement rule (a long pass 1 line can push later lines further than in pass 2) |
 | `pass2/lines/ep<episode>_<character>_row<excel row>.wav` | The same rows after pass 2 (the audio delivered) |
 | `pass2/tracks/ep<episode>_<character>.wav` | One full-length timeline per episode and character, built from the pass 2 lines |
 | `ep<episode>_timeline.csv` | All characters of an episode in adjusted chronological order, with the dialogue actually spoken |

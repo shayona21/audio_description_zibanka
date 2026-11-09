@@ -16,11 +16,17 @@
 
 ZIP layout (names are lowercase, spaces as "_"):
   pass1/lines/ep<ep>_<character>_row<row>.wav     the ElevenLabs dub, leading silence trimmed
+  pass1/tracks/ep<ep>_<character>.wav             one timeline per <character, episode>, from pass 1
   pass2/lines/ep<ep>_<character>_row<row>.wav     each line after pass 1.5 and pass 2 (the audio delivered)
   pass2/tracks/ep<ep>_<character>.wav             one timeline per <character, episode>, from pass 2
   ep<ep>_timeline.csv                             combined timeline per episode (pass 2, final dialogue)
   processing_report.csv                           one record per row, every pass side by side
   script.xlsx                                     copy of the input workbook
+
+Both passes' tracks are placed with the same rule (``place_dialogue``): each line starts on its TCR
+IN, or straight after the same character's previous line if that one runs late. Each pass is placed
+with its own clip lengths, so a long pass 1 line can push later lines further than in pass 2. The
+timelines and the report's adjusted TCRs describe pass 2, the audio delivered.
 """
 
 from collections import defaultdict
@@ -62,6 +68,7 @@ class Line:
     pass2_speed: float = 1.0
     pass2: Measurement = None
     clip_ms: int = 0               # full pass 2 clip length, used for placement
+    pass1_clip_ms: int = 0         # full pass 1 clip length, used to place the pass 1 tracks
 
     @property
     def slot_ms(self):
@@ -102,8 +109,8 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
     progress(f"Validated {len(rows)} dialogue rows; {len(names)} tracks; {fps} fps")
     with tempfile.TemporaryDirectory(prefix="ad-v2-", dir=output_path.parent) as workspace:
         workspace = Path(workspace)
-        for folder in (f"{PASS1_DIR}/{LINES_DIR}", f"{KEPT_DIR}/{LINES_DIR}", f"{PASS2_DIR}/{LINES_DIR}",
-                       f"{PASS2_DIR}/{TRACKS_DIR}"):
+        for folder in (f"{PASS1_DIR}/{LINES_DIR}", f"{PASS1_DIR}/{TRACKS_DIR}", f"{KEPT_DIR}/{LINES_DIR}",
+                       f"{PASS2_DIR}/{LINES_DIR}", f"{PASS2_DIR}/{TRACKS_DIR}"):
             (workspace / folder).mkdir(parents=True)
 
         def save(folder, row, wav):
@@ -119,6 +126,7 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
             take, trimmed = generate(row, row.text)
             line = Line(row, trimmed, measure(take, row.end_ms - row.start_ms), text=row.text)
             line.pass1_5 = line.pass1
+            line.pass1_clip_ms = len(read_clip(take))
             save(PASS1_DIR, row, take)
             save(KEPT_DIR, row, take)
             lines[row.row_number] = line
@@ -155,6 +163,9 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
         progress("Resolving audio collisions independently for each episode and character")
         placements = {p.row.row_number: p for p in
                       place_dialogue(final_rows, {n: line.clip_ms for n, line in lines.items()})}
+        pass1_placements = {p.row.row_number: p for p in
+                            place_dialogue(rows, {n: line.pass1_clip_ms for n, line in lines.items()})}
+        pass1_paths = {row.row_number: workspace / PASS1_DIR / LINES_DIR / line_name(row) for row in rows}
         # Disk use is kept low by streaming into the ZIP: each full-length track goes into the ZIP
         # the moment it is built and its WAV is deleted, so only one track is ever on disk.
         with StreamingArchive(output_path) as archive:
@@ -163,17 +174,19 @@ def run_pipeline(excel_path, output_path, *, fps=25, sheet_name=None, synthesize
                     archive.add(path, path.relative_to(workspace).as_posix())
 
             update_state(90, "Building character tracks")
-            groups, episode_ends = defaultdict(list), defaultdict(int)
-            for placed in placements.values():
-                row = placed.row
-                groups[row.group].append((placed, clip_paths[row.row_number]))
-                episode_ends[row.episode] = max(episode_ends[row.episode], row.end_ms, placed.end_ms)
-            for index, group in enumerate(sorted(groups), start=1):
-                progress(f"Building {PASS2_DIR}/{names[group]}")
-                track_path = workspace / PASS2_DIR / TRACKS_DIR / names[group]
-                build_track(groups[group], episode_ends[group[0]], track_path)
-                archive.add(track_path, track_path.relative_to(workspace).as_posix(), delete=True)
-                update_state(90 + round(index / len(groups) * 9), "Building character tracks")
+            passes = ((PASS1_DIR, pass1_placements, pass1_paths), (PASS2_DIR, placements, clip_paths))
+            for step, (pass_dir, pass_placements, paths) in enumerate(passes):
+                groups, episode_ends = defaultdict(list), defaultdict(int)
+                for placed in pass_placements.values():
+                    row = placed.row
+                    groups[row.group].append((placed, paths[row.row_number]))
+                    episode_ends[row.episode] = max(episode_ends[row.episode], row.end_ms, placed.end_ms)
+                for index, group in enumerate(sorted(groups), start=1):
+                    progress(f"Building {pass_dir}/{TRACKS_DIR}/{names[group]}")
+                    track_path = workspace / pass_dir / TRACKS_DIR / names[group]
+                    build_track(groups[group], episode_ends[group[0]], track_path)
+                    archive.add(track_path, track_path.relative_to(workspace).as_posix(), delete=True)
+                    update_state(90 + round((step + index / len(groups)) / len(passes) * 9), "Building character tracks")
 
             update_state(99, "Packaging download")
             records = [report_record(lines[row.row_number], placements[row.row_number], names[row.group], fps)
